@@ -168,11 +168,22 @@ export https_proxy="http://127.0.0.1:#PORT#"
 export HTTP_PROXY="http://127.0.0.1:#PORT#"
 export HTTPS_PROXY="http://127.0.0.1:#PORT#"
 
-MITM_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+MITM_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.cer"
 GUIX_CA="$GUIX_ENVIRONMENT/etc/ssl/certs/ca-certificates.crt"
-cat "$GUIX_CA" "$MITM_CA" > /tmp/guix-agent-ca-bundle.pem
-export SSL_CERT_FILE=/tmp/guix-agent-ca-bundle.pem
-export REQUESTS_CA_BUNDLE=/tmp/guix-agent-ca-bundle.pem
+
+CA_BUNDLE="/tmp/guix-agent-ca-bundle.pem"
+{
+    cat "$GUIX_CA"
+    printf '\n'
+    cat "$MITM_CA"
+    printf '\n'
+} > "$CA_BUNDLE"
+
+export SSL_CERT_FILE="$CA_BUNDLE"
+export REQUESTS_CA_BUNDLE="$CA_BUNDLE"
+export CURL_CA_BUNDLE="$CA_BUNDLE"
+export GIT_SSL_CAINFO="$CA_BUNDLE"
+export NODE_EXTRA_CA_CERTS="$MITM_CA"
 
 # Set environment for API keys
 export OPENAI_API_KEY="dummy_key"
@@ -181,3 +192,5 @@ export OLLAMA_API_KEY="dummy-key"
 export LANGSMITH_API_KEY="dummy-key"
 export LANGSMITH_TRACING="true"
 export LANGSMITH_PROJECT="lca-deepagents"
+
+# uv run python -c "import requests; print(requests.get('https://example.com').status_code)"

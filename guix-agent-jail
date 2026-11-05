@@ -241,7 +241,7 @@ guix shell --container --emulate-fhs --network \
   --share="$CONTAINER_HOME"="$HOME" \
   --share="$HOME/.cache/uv" \
   --share="$HOME/.local/share/uv" \
-  --expose="$HOME/.mitmproxy"="$HOME/.mitmproxy" \
+  --expose="$HOME/.mitmproxy/mitmproxy-ca-cert.cer" \
   --expose="$PNPM_HOST_PATH"="/host-pnpm" \
   --preserve='^TERM$' \
   gcc-toolchain uv python bash coreutils git findutils nss-certs less \
