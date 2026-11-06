@@ -1,4 +1,4 @@
-# Guix Agent Jail: Zero-Trust Runtime & Credential Isolation Proxy
+# Guix Terminal Jail: Zero-Trust Runtime & Credential Isolation Proxy
 
 **Author:** Steven J Holtz
 
@@ -79,7 +79,7 @@ active terminal sessions per workspace.
     | HOST MACHINE                                                                             |
     |                                                                                          |
     |  +-------------------------------+             +-------------------------------------+   |
-    |  | .env.guix-agent-jail          |             | mitmproxy (inject_keys.py)          |   |
+    |  | .env.guix-terminal-jail       |             | mitmproxy (inject_keys.py)          |   |
     |  | - HOST_OPENAI_API_KEY         |------------>| - Intercepts requests on port 8080  |   |
     |  | - HOST_ANTHROPIC_API_KEY      |             | - Identifies target host domain     |   |
     |  | - HOST_OLLAMA_API_KEY         |             | - Injects real API keys into header |   |
@@ -124,8 +124,8 @@ active terminal sessions per workspace.
 sequenceDiagram
 autonumber
 actor User as Host User / Shell
-participant Jail as guix-agent-jail Script
-participant State as Host State (~/.config/guix-agent/state)
+participant Jail as guix-terminal-jail Script
+participant State as Host State (~/.config/guix-terminal/state)
 participant Proxy as Host mitmproxy (inject_keys.py)
 participant Container as Guix Container Sandbox
 participant API as External LLM API (OpenAI/Anthropic/Ollama/LangSmith)
@@ -159,7 +159,7 @@ Jail->>State: Enforce 700/600 permissions on STATE_DIR
 
 ## Component Breakdown
 
-### 1. Container Jail Script (`guix-agent-jail`)
+### 1. Container Jail Script (`guix-terminal-jail`)
 
 The shell launcher creates a lightweight, isolated GNU Guix container
 with FHS emulation and manages background dependencies:
@@ -170,7 +170,7 @@ with FHS emulation and manages background dependencies:
 
 - **Workspace Isolation & Deterministic Hashing**: Computes a SHA-256
   hash of =PROJECT_DIR= to isolate states into dedicated directories
-  (`~/.config/guix-agent/state/projects/`). Different project
+  (`~/.config/guix-terminal/state/projects/`). Different project
   workspaces run on independent proxy ports and maintain isolated
   states.
 
@@ -187,7 +187,7 @@ with FHS emulation and manages background dependencies:
 
 - **Global History Vaulting & Synchronization**: Maintains global
   command histories (`.bash_history`, `.python_history`, `.lesshst`)
-  in `~/.config/guix-agent/state`. When the first session opens in a
+  in `~/.config/guix-terminal/state`. When the first session opens in a
   workspace, it seeds the workspace home with global history. When the
   last session exits, it appends workspace history back to the global
   vault and de-duplicates `.bash_history` while preserving
@@ -220,9 +220,9 @@ A Python add-on for `mitmproxy` running on the host machine:
   (`api.openai.com`, `api.anthropic.com`, `ollama.com`,
   `api.smith.langchain.com`).
 
-- Loads header mappings from `~/.config/guix-agent/key-injector.toml`.
+- Loads header mappings from `~/.config/guix-terminal/key-injector.toml`.
 
-- Loads live environment secrets from `.env.guix-agent-jail` located
+- Loads live environment secrets from `.env.guix-terminal-jail` located
   in the parent directory of the current workspace.
 
 - Selects the appropriate header configuration based on the target
@@ -239,7 +239,7 @@ A Python add-on for `mitmproxy` running on the host machine:
 
 - Writes injector messages at `INFO` level and above to
   `inject_keys.log`. The default path is the parent of the directory
-  from which `guix-agent-jail` was launched. Set `KEY_INJECTOR_LOG` to
+  from which `guix-terminal-jail` was launched. Set `KEY_INJECTOR_LOG` to
   choose an explicit log-file path.
 
 - Uses a dedicated file handler rather than `logging.basicConfig`, so
@@ -248,7 +248,7 @@ A Python add-on for `mitmproxy` running on the host machine:
 
 ### 3. Container Shell Configuration (`bashrc`)
 
-The container shell template (`~/.config/guix-agent/
+The container shell template (`~/.config/guix-terminal/bashrc`):
 
 - Automatically receives the dynamically allocated proxy port via sed
   substitution.
@@ -319,8 +319,8 @@ use `type -a mitmdump` to list all matching executables and adjust
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/sjholtz/guix-agent-jail.git
-   cd guix-agent-jail
+   git clone https://github.com/sjholtz/guix-terminal-jail.git
+   cd guix-terminal-jail
    ```
 
 2. Place the mitmproxy injector script in your home binary path and
@@ -328,8 +328,8 @@ use `type -a mitmdump` to list all matching executables and adjust
    ```bash
    mkdir -p ~/bin
    cp inject_keys.py ~/bin/
-   mkdir -p ~/.config/guix-agent
-   cp key-injector.toml ~/.config/guix-agent/
+   mkdir -p ~/.config/guix-terminal
+   cp key-injector.toml ~/.config/guix-terminal/
    ```
 
 3. Configure host credentials:
@@ -337,27 +337,27 @@ use `type -a mitmdump` to list all matching executables and adjust
    Copy the example environment template to your project’s parent
    directory:
    ```bash
-   cp .env.example /<path>/.env.guix-agent-jail
-   # Edit .env.guix-agent-jail with your provider keys
+   cp .env.example /<path>/.env.guix-terminal-jail
+   # Edit .env.guix-terminal-jail with your provider keys
    ```
 
    The `<path>` here must be to the *parent* directory of the project
    directory that your agent code is in. For example, if your code is
-   in `/home/<user>/my-project/src/`, the `.env.guix-agent-jail` file
+   in `/home/<user>/my-project/src/`, the `.env.guix-terminal-jail` file
    must reside in `/home/<user>/my-project/`.
 
-   Edit the `.env.guix-agent-jail` file with your live provider API
+   Edit the `.env.guix-terminal-jail` file with your live provider API
    keys.
 
    The configuration path override can also be placed in this file. For
    example:
    ```bash
-   KEY_INJECTOR_CONFIG=/home/<user>/.config/guix-agent/key-injector.toml
+   KEY_INJECTOR_CONFIG=/home/<user>/.config/guix-terminal/key-injector.toml
    ```
 
 4. Copy `bashrc` into user configuration directory:
    ```bash
-   cp bashrc ~/.config/guix-agent
+   cp bashrc ~/.config/guix-terminal
    ```
 
 <a id="orgfec4133"></a>
@@ -365,17 +365,17 @@ use `type -a mitmdump` to list all matching executables and adjust
 ### Configure Header Injection
 
 The injector reads provider mappings from
-`~/.config/guix-agent/key-injector.toml` by default. This file
+`~/.config/guix-terminal/key-injector.toml` by default. This file
 contains no secrets; it simply maps target host URLs to environment
 variable names.
 
 To use a different configuration file, add it to the parent-directory
-`.env.guix-agent-jail` file exactly as shown above, or export
+`.env.guix-terminal-jail` file exactly as shown above, or export
 `KEY_INJECTOR_CONFIG=<path>/key-injector.toml` before launching the
 sandbox, as shown below:
 ```bash
 export KEY_INJECTOR_CONFIG=/path/to/key-injector.toml
-guix-agent-jail
+guix-terminal-jail
 ```
 
 The `key-injector.toml` file looks like this:
@@ -419,7 +419,7 @@ The sandbox launcher automatically starts and stops `mitmdump` in the
 background.
 
 ```bash
-guix-agent-jail [-h] [-m inject_keys_path] [project_dir]
+guix-terminal-jail [-h] [-m inject_keys_path] [project_dir]
 ```
 
 #### Arguments & Options
@@ -436,7 +436,7 @@ guix-agent-jail [-h] [-m inject_keys_path] [project_dir]
 - Launching from your project directory:
   ```bash
   cd /home/<user>/project_dir/src/
-  guix-agent-jail
+  guix-terminal-jail
   ```
 
 - Opening a second terminal in the same workspace (attaches to
@@ -445,17 +445,17 @@ guix-agent-jail [-h] [-m inject_keys_path] [project_dir]
   # In terminal 2:
 
   cd /home/<user>/project_dir/src/
-  guix-agent-jail
+  guix-terminal-jail
   ```
 
 - Specifying a project directory explicitly:
   ```bash
-  guix-agent-jail /home/<user>/my-project/src/
+  guix-terminal-jail /home/<user>/my-project/src/
   ```
 
 - Specifying a non-default location for mitmproxy key injector script:
   ```bash
-  guix-agent-jail -m /custom/path/inject_keys.py
+  guix-terminal-jail -m /custom/path/inject_keys.py
   ```
 
 #### Injector Log
@@ -466,8 +466,8 @@ project and is placed in the parent of the directory from which the
 launcher was started. To select a fixed path, set `KEY_INJECTOR_LOG`
 in the host environment before launching the jail:
 ```bash
-export KEY_INJECTOR_LOG="$HOME/.local/state/guix-agent/inject_keys.log"
-guix-agent-jail
+export KEY_INJECTOR_LOG="$HOME/.local/state/guix-terminal/inject_keys.log"
+guix-terminal-jail
 ```
 
 If the log file is absent, first check the resolved path and confirm
@@ -477,8 +477,8 @@ that `mitmdump` is the `uv` installation as described above.
 
 ## Security & Key Management Best Practices
 
-- **Repository Sanitation**: Never commit `.env.guix-agent-jail` or
-  live secrets. Keep `.env.guix-agent-jail` listed in your project’s
+- **Repository Sanitation**: Never commit `.env.guix-terminal-jail` or
+  live secrets. Keep `.env.guix-terminal-jail` listed in your project’s
   `.gitignore`.
 
 - **Certificate Security**: Treat the generated
@@ -486,8 +486,8 @@ that `mitmdump` is the `uv` installation as described above.
   decryption of container-initiated TLS traffic.
 
 - **State File Permissions**: All files under
-  `~/.config/guix-agent/state` are strictly vault-protected with `600`
-  permissions for files and `700` for directories to ensure no
+  `~/.config/guix-terminal/state` are strictly vault-protected with
+  `600` permissions for files and `700` for directories to ensure no
   unprivileged local processes can read history or socket state.
 
 - **Key Rotation**: If keys are exposed or compromised during

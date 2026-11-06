@@ -8,6 +8,10 @@ environment_variable = "HOST_OPENAI_API_KEY"
 host = "ollama.com"
 environment_variable = "HOST_OLLAMA_API_KEY"
 
+[[auth.headers]]
+host = "api.githubcopilot.com"
+environment_variable = "HOST_GITHUB_API_KEY"
+
 [x-api]
 
 [[x-api.headers]]

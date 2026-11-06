@@ -37,9 +37,9 @@ if not any(
 
 logger.info(f"WD is {wd_path}")
 
-env_path = wd_path / ".env.guix-agent-jail"
+env_path = wd_path / ".env.guix-terminal-jail"
 if not env_path.exists():
-    logger.critical("No .env.guix-agent-jail exists in WD.")
+    logger.critical("No .env.guix-terminal-jail exists in WD.")
     import sys
 
     sys.exit(1)
@@ -111,7 +111,7 @@ class KeyInjector:
         self.config_path = Path(
             configured_path
             if configured_path
-            else Path.home() / ".config" / "guix-agent" / "key-injector.toml"
+            else Path.home() / ".config" / "guix-terminal" / "key-injector.toml"
         )
         self.mappings = load_header_mappings(self.config_path)
 

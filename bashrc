@@ -2,12 +2,12 @@
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
 
-# This file gets copied into /tmp/guix-agent-home/.bashrc when the
-# '~/bin/guix-agent-jail' file is executed. Here it serves as the
+# This file gets copied into /tmp/guix-terminal-home/.bashrc when the
+# '~/bin/guix-terminal-jail' file is executed. Here it serves as the
 # .bashrc for the Guix container that is spawned. Most of the contents
 # mirror my personal .bashrc so that bash in the Guix container
 # behaves as I am used to. Note that the prompt here is augmented with
-# '[guix-agent]' so that it is clear what shell environment is
+# '[guix-term]' so that it is clear what shell environment is
 # executing.
 
 # If not running interactively, don't do anything
@@ -79,9 +79,9 @@ esac
 # fi
 
 if [ "$color_prompt" = yes ]; then
-    PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ [guix-agent]'
+    PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ [guix-term]'
 else
-    PS1='${debian_chroot:+($debian_chroot)}\u@\h:\w\$ [guix-agent] '
+    PS1='${debian_chroot:+($debian_chroot)}\u@\h:\w\$ [guix-term] '
 fi
 unset color_prompt force_color_prompt
 
@@ -171,7 +171,7 @@ export HTTPS_PROXY="http://127.0.0.1:#PORT#"
 MITM_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.cer"
 GUIX_CA="$GUIX_ENVIRONMENT/etc/ssl/certs/ca-certificates.crt"
 
-CA_BUNDLE="/tmp/guix-agent-ca-bundle.pem"
+CA_BUNDLE="/tmp/guix-terminal-ca-bundle.pem"
 {
     cat "$GUIX_CA"
     printf '\n'
@@ -192,5 +192,3 @@ export OLLAMA_API_KEY="dummy-key"
 export LANGSMITH_API_KEY="dummy-key"
 export LANGSMITH_TRACING="true"
 export LANGSMITH_PROJECT="lca-deepagents"
-
-# uv run python -c "import requests; print(requests.get('https://example.com').status_code)"
