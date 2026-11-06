@@ -12,10 +12,10 @@ MITM_SCRIPT="$HOME/bin/inject_keys.py"
 usage() {
     echo "Usage: $0 [-h] [-m inject_keys_path] [-p pnpm_host_path] [project_dir]"
     echo
-    echo "Launches a Guix container environment for the specified Python project."
+    echo "Launches a Guix container environment in a project’s root directory."
     echo
     echo "Arguments:"
-    echo "  project_dir  Directory of the project (default: current working directory)"
+    echo "  project_dir  Root directory of the project (default: current working directory)"
     echo
     echo "Options:"
     echo "  -h           Show this help message and exit"
@@ -25,7 +25,7 @@ usage() {
 }
 
 # Parse command-line options
-while getopts "hm:" opt; do
+while getopts "hm:p:" opt; do
   case "$opt" in
     h) usage ;;
     m) MITM_SCRIPT="$OPTARG" ;;
@@ -52,190 +52,212 @@ if [ ! -f "$MITM_SCRIPT" ]; then
     exit 1
 fi
 
-enforce_permissions() {
-    if [ -d "$STATE_DIR" ]; then
-        find "$STATE_DIR" -type d  -exec chmod 700 {} + 2>/dev/null || true
-        find "$STATE_DIR" -type f  -exec chmod 600 {} + 2>/dev/null || true
-    fi
-}
-
-# Persistent state directory on host
-STATE_DIR="$HOME/.config/guix-agent/state"
-
-# Workspace specific state directory scoped to PROJECT_DIR
-PROJECT_HASH=$(echo -n "$PROJECT_DIR" | sha256sum | awk '{print $1}')
+# Each project has one lock, one proxy and one home shared by its terminals.
+STATE_DIR="$HOME/.config/guix-terminal/state"
+PROJECT_HASH=$(printf '%s' "$PROJECT_DIR" | sha256sum | awk '{print $1}')
 WORKSPACE_STATE_DIR="$STATE_DIR/projects/$PROJECT_HASH"
+# The clients dir stores files with PID names and process start time contents
 CLIENTS_DIR="$WORKSPACE_STATE_DIR/clients"
+# Filename is this shell's PID
+CLIENT_FILE="$CLIENTS_DIR/$$"
+CONTAINER_HOME="$WORKSPACE_STATE_DIR/home"
+PID_FILE="$WORKSPACE_STATE_DIR/mitmdump.pid"
+PORT_FILE="$WORKSPACE_STATE_DIR/mitmdump.port"
+START_FILE="$WORKSPACE_STATE_DIR/mitmdump.start"
+PENDING_PID=""
 
+for program in ss flock mitmdump guix; do
+    command -v "$program" >/dev/null || {
+        echo "Missing host command: $program" >&2
+        exit 1
+    }
+done
+MITM_SCRIPT=$(realpath "$MITM_SCRIPT")
 mkdir -p "$CLIENTS_DIR"
 
-CLIENT_FILE="$CLIENTS_DIR/$$"
-touch "$CLIENT_FILE"
-
-# Create container home shared across terminals in the same workspace
-CONTAINER_HOME="$WORKSPACE_STATE_DIR/home"
-
-enforce_permissions
-
-# Tracked state for clean-up
-SPAWNED_MITM_PID=""
-
-# Cleanup hook executed on exit or termination signals
-cleanup() {
-    local exit_code=$?
-    trap - EXIT INT TERM
-
-    # Unregister this terminal session
-    rm -f "$CLIENT_FILE"
-
-    # Garbage collect dead sessions and count remaining active clients
-    local remaining_clients=0
-    if [ -d "$CLIENTS_DIR" ]; then
-        for file in "$CLIENTS_DIR"/*; do
-            [ -e "$file" ] || continue
-            local client_pid="${file##*/}"
-            if kill -0 "$client_pid" 2>/dev/null; then
-                remaining_clients=$((remaining_clients + 1))
-            else
-                # Cleanup stale registration from unclean shutdown
-                rm -f "$file"
-            fi
-        done
-    fi
-
-    # Only kill mitmdump if no other terminal sessions are active on
-    # this workspace
-    if [ "$remaining_clients" -eq 0 ]; then
-        local pid_file="$WORKSPACE_STATE_DIR/mitmdump.pid"
-        if [ -f "$pid_file" ]; then
-            local mitm_pid=$(cat "$pid_file")
-            if [ -n "$mitm_pid" ] && kill -0 "$mitm_pid" 2>/dev/null; then
-                kill "$mitm_pid" 2>/dev/null || true
-                wait "$mitm_pid" 2>/dev/null || true
-                echo "Stopped mitmdump (PID: $mitm_pid}."
-            fi
-            rm -f "pid_file" "$WORKSPACE_STATE_DIR/mitmdump.port"
-        fi
-    fi
-
-    if [ -n "$CONTAINER_HOME" ] && [ -d "$CONTAINER_HOME" ]; then
-        # Preserve histories to per-workspace state directory before removing temp home
-        [ -f "$CONTAINER_HOME/.bash_history" ] && cp "$CONTAINER_HOME/.bash_history" "$WORKSPACE_STATE_DIR/bash_history"
-        [ -f "$CONTAINER_HOME/.lesshst" ] && cp "$CONTAINER_HOME/.lesshst" "$WORKSPACE_STATE_DIR/lesshst"
-        [ -f "$CONTAINER_HOME/.python_history" ] && cp "$CONTAINER_HOME/.python_history" "$WORKSPACE_STATE_DIR/python_history"
-
-        rm -rf "$CONTAINER_HOME"
-    fi
-
-    enforce_permissions
-
-    exit "$exit_code"
+# Field 22 is the Linux process start time. Remove PID and the parenthesized
+# name first because the name can contain spaces. Ignore zombie processes.
+process_start() {
+    [[ $1 =~ ^[1-9][0-9]*$ ]] || return 1
+    # From '/proc/pid/stat':
+    #   - Remove the first 2 fields: Field 2 is the process name in parenthesis
+    #   - If the 3rd field ($1 after removing 1st 2 fields) is 'Z' it is a zombie process
+    #   - NF is the number of fields
+    #   - print field 22 ($20 after removing 1st 2 fields)
+    #
+    # The process start time is "the time the process started after
+    # system boot." (from docs: `man 5 proc_pid_stat`)
+    awk '{sub(/^.*\) /,""); if ($1 != "Z" && NF >= 20) print $20; else exit 1}' \
+        "/proc/$1/stat" 2>/dev/null
 }
 
-# Trap script termination (EXIT), SIGINT (Ctrl+C), and SIGTERM
-trap cleanup EXIT INT TERM
+# True only if this PID owns the TCP listener at 127.0.0.1:port.
+owns_proxy_port() {
+    local pid=$1 port=$2 listeners
+    [[ $pid =~ ^[1-9][0-9]*$ && $port =~ ^[0-9]{1,5}$ ]] || return 1
+    listeners=$(ss -H -4 -ltnp "src 127.0.0.1 and sport = :$port") || return 1
+    [[ $listeners == *"pid=$pid,"* ]]
+}
 
-# Function to ensure mitmdump is running on a valid port
-ensure_mitmproxy() {
-    local port="${1:-8080}"
-    local max_attempts=10
-    local attempt=0
-    local pid_file="$WORKSPACE_STATE_DIR/mitmdump.pid"
-    local port_file="$WORKSPACE_STATE_DIR/mitmdump.port"
+# Set PROXY_PID, PROXY_START and PORT only from a verified workspace record.
+load_proxy() {
+    [[ -s $PID_FILE && -s $START_FILE && -s $PORT_FILE ]] || return 1
+    PROXY_PID=$(<"$PID_FILE")
+    PROXY_START=$(<"$START_FILE")
+    PORT=$(<"$PORT_FILE")
+    [[ $PROXY_START =~ ^[0-9]+$ ]] &&
+        [[ $(process_start "$PROXY_PID") == "$PROXY_START" ]] &&
+        owns_proxy_port "$PROXY_PID" "$PORT"
+}
 
-    # Re-use existing mitmdump injector for the exact same workspace
-    if [ -f "$pid_file" ] && [ -f "$port_file" ]; then
-        local saved_pid=$(cat "$pid_file")
-        local saved_port=$(cat "$port_file")
-        if kill -0 "$saved_pid" 2>/dev/null && nc -z 127.0.0.1 "$saved_port" 2>/dev/null;  then
-            echo "Connected to existing mitmdump on port $saved_port for workspace '$PROJECT_DIR' (PID: $saved_pid)."
-            PORT="$saved_port"
-            return 0
-        fi
-        # Clear stale PID/port files if process died
-        rm -f "$pid_file" "$port_file"
+discard_candidate() {
+    if [[ -n $PENDING_PID ]]; then
+        kill "$PENDING_PID" 2>/dev/null || true
+        wait "$PENDING_PID" 2>/dev/null || true
+        PENDING_PID=""
     fi
+}
 
-    while [ "$attempt" -lt "$max_attempts" ]; do
-        echo "Attempting to start mitmdump on port $port for workspace '$PROJECT_DIR'."
+ensure_mitmproxy() {
+    local port start
+    if load_proxy; then
+        echo "Reusing mitmdump for '$PROJECT_DIR' (PID $PROXY_PID, port $PORT)."
+        return 0
+    fi
+    rm -f -- "$PID_FILE" "$START_FILE" "$PORT_FILE"
 
-        # Explicitly bind to loopback address (127.0.0.1) and ensure
-        # execution context is PROJECT_DIR
-        (cd "$PROJECT_DIR" && mitmdump --listen-host 127.0.0.1 -s "$MITM_SCRIPT" -p "$port" >/dev/null 2>&1) &
+    for ((port=8080; port<8090; port++)); do
+        # Close the inherited lock descriptor. exec makes $! the mitmdump PID.
+        (
+            # Remove the output file descriptor 9 for this subshell
+            exec 9>&-
+            cd -- "$PROJECT_DIR" || exit 1
+            exec mitmdump --listen-host 127.0.0.1 -s "$MITM_SCRIPT" -p "$port"
+        ) >"$WORKSPACE_STATE_DIR/mitmdump-$port.log" 2>&1 &
+        PENDING_PID=$!
 
-        # Remember mitmdump's process ID
-        local spawned_pid=$!
-
-        # Polling loop to verfiy health and port binding of mitmdump
-        local ready=0
-        for _ in {1..20}; do # Poll up to 2 seconds (20 x 0.1 sec)
-            # Check if process crashed or exited unexpectedly
-            if ! kill -0 "$spawned_pid" 2>/dev/null; then
-                break
+        for _ in {1..50}; do
+            kill -0 "$PENDING_PID" 2>/dev/null || break
+            if owns_proxy_port "$PENDING_PID" "$port"; then
+                start=$(process_start "$PENDING_PID") || break
+                printf '%s\n' "$PENDING_PID" > "$PID_FILE"
+                printf '%s\n' "$start" > "$START_FILE"
+                printf '%s\n' "$port" > "$PORT_FILE"
+                printf '%s\n' "$PROJECT_DIR" > "$WORKSPACE_STATE_DIR/project_path"
+                PORT=$port
+                echo "Started mitmdump for '$PROJECT_DIR' (PID $PENDING_PID, port $PORT)."
+                PENDING_PID=""
+                return 0
             fi
-
-            # Check if port is actively listening
-            if $(nc -z 127.0.0.1 "$port") 2>/dev/null; then
-                ready=1
-                break
-            fi
-
             sleep 0.1
         done
-
-        if [ "$ready" -eq 1 ]; then
-            PORT="$port"
-            echo "$spawned_pid" > "$pid_file"
-            echo "$PORT" > "$port_file"
-            echo "$PROJECT_DIR" > "$WORKSPACE_STATE_DIR/project_path"
-            return 0
-        fi
-
-        # Handle failure (process died or failed to bind in time)
-        if kill -0 "$spawned_pid" 2>/dev/null; then
-            kill "$spawned_pid" 2>/dev/null
-            wait "$spawned_pid" 2>/dev/null || true
-        fi
-
-        port=$((port + 1))
-        attempt=$((attempt + 1))
+        discard_candidate
     done
-
-    echo "Error: Unable to start mitmdump after $max_attempts attempts." >&2
-    exit 1
+    echo "Could not start a proxy on ports 8080–8089. See $WORKSPACE_STATE_DIR/mitmdump-*.log" >&2
+    return 1
 }
 
-# Resolve port and ensure proxy is active starting at 8080
-ensure_mitmproxy 8080
+cleanup() {
+    local status=$? client pid started remaining=0
+    trap - EXIT
+    trap '' HUP INT TERM
+    flock -x 9 || exit 1
+    discard_candidate
+    rm -f -- "$CLIENT_FILE"
+
+    for client in "$CLIENTS_DIR"/*; do
+        [[ -f $client ]] || continue
+        pid=${client##*/}
+        started=$(process_start "$pid") || started=""
+        # Older launchers used empty client files; keep a live legacy client.
+        if [[ -n $started && ( ! -s $client || $(<"$client") == "$started" ) ]]; then
+            remaining=1
+        else
+            rm -f -- "$client"
+        fi
+    done
+
+    if (( remaining == 0 )); then
+        if load_proxy; then
+            kill "$PROXY_PID" 2>/dev/null || true
+            # The last launcher may be a different terminal from its parent.
+            for _ in {1..100}; do
+                [[ $(process_start "$PROXY_PID") == "$PROXY_START" ]] || break
+                sleep 0.1
+            done
+            if [[ $(process_start "$PROXY_PID") == "$PROXY_START" ]]; then
+                echo "mitmdump PID $PROXY_PID is still exiting; keeping its state." >&2
+                exit 1
+            fi
+            wait "$PROXY_PID" 2>/dev/null || true
+            echo "Stopped mitmdump for '$PROJECT_DIR' (PID $PROXY_PID)."
+        fi
+        rm -f -- "$PID_FILE" "$START_FILE" "$PORT_FILE"
+
+        if [[ -d $CONTAINER_HOME ]]; then
+            for name in bash_history lesshst python_history; do
+                if [[ -f $CONTAINER_HOME/.$name ]]; then
+                    cp -- "$CONTAINER_HOME/.$name" "$WORKSPACE_STATE_DIR/$name"
+                fi
+            done
+            rm -rf -- "$CONTAINER_HOME"
+        fi
+    fi
+    exit "$status"
+}
+
+# Register/start and unregister/stop under the same lock. The
+# interactive shell runs unlocked so other terminals can enter or
+# leave this project.
+#
+# Assign output file descriptor 9 to the workspace.lock file, creating
+# the file.
+exec 9>"$WORKSPACE_STATE_DIR/workspace.lock"
+# Create an exclusive lock on file descriptor 9 (i.e. on the
+# workspace.lock file)
+flock -x 9
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Get this process's start time and store it in the client file for
+# this process:
+process_start "$$" > "$CLIENT_FILE"
+ensure_mitmproxy
 
 # Ensure host container-bashrc exists
-CONTAINER_BASHRC="$HOME/.config/guix-agent/bashrc"
+CONTAINER_BASHRC="$HOME/.config/guix-terminal/bashrc"
 if [ ! -f "$CONTAINER_BASHRC" ]; then
-    mkdir -p "$HOME/.config/guix-agent"
+    mkdir -p -- "$HOME/.config/guix-terminal"
     cat <<EOF > "$CONTAINER_BASHRC"
-export PS1=" \u@\h:\w\$ [guix-agent]"
+export PS1=" \u@\h:\w\$ [guix-term]"
 EOF
 fi
 
-# Seed container home with globals histories if this is the first
+# Seed container home with the last history if this is the first
 # active terminal in the workspace
 if [  ! -d "$CONTAINER_HOME" ]; then
-    mkdir -p "$CONTAINER_HOME"
-    [ -f "$STATE_DIR/bash_history" ] && cp "$STATE_DIR/bash_history" "$CONTAINER_HOME/.bash_history"
-    [ -f "$STATE_DIR/lesshst" ] && cp "$STATE_DIR/lesshst" "$CONTAINER_HOME/.lesshst"
-    [ -f "$STATE_DIR/python_history" ] && cp "$STATE_DIR/python_history" "$CONTAINER_HOME/.python_history"
+    mkdir -p -- "$CONTAINER_HOME"
+    for name in bash_history lesshst python_history; do
+        if [[ -f $WORKSPACE_STATE_DIR/$name ]]; then
+            cp -- "$WORKSPACE_STATE_DIR/$name" "$CONTAINER_HOME/.$name"
+        fi
+    done
 fi
 
 # Substitute #PORT# with the dynamic $PORT directly into container
-sed "s/#PORT#/$PORT/g" "$CONTAINER_BASHRC" > "$CONTAINER_HOME/.bashrc"
+sed "s/#PORT#/$PORT/g" "$CONTAINER_BASHRC" > "$CONTAINER_HOME/.bashrc.new"
+mv -f -- "$CONTAINER_HOME/.bashrc.new" "$CONTAINER_HOME/.bashrc"
+# Drop the lock on file descriptor 9 (i.e. of the workspace.lock file)
+flock -u 9
 
 # Make sure directories exist before mounting them
-mkdir -p "$HOME/.cache/uv" "$HOME/.local/share/uv" "$HOME/.mitmproxy"
+mkdir -p -- "$HOME/.cache/uv" "$HOME/.local/share/uv" "$HOME/.mitmproxy"
 
 # Set path to pnpm on the container's host for exposing in container
 PNPM_HOST_PATH="${PNPM_HOST_PATH:-$HOME/.local/share/pnpm}"
 
-# Start the container
+# Start the container and remove the output file descriptor 9
 guix shell --container --emulate-fhs --network \
   --share="$PROJECT_DIR"=/workspace \
   --share="$CONTAINER_HOME"="$HOME" \
@@ -246,4 +268,4 @@ guix shell --container --emulate-fhs --network \
   --preserve='^TERM$' \
   gcc-toolchain uv python bash coreutils git findutils nss-certs less \
   curl cmp grep zlib node sed \
-  -- sh -c "cd /workspace && exec bash"
+  -- sh -c "cd /workspace && exec bash" 9>&-
