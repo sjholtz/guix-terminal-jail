@@ -1,50 +1,19 @@
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime as dt
 from pathlib import Path
 
 import tomllib
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from mitmproxy import http
 
-wd_path = Path.cwd().parent
-
+# The launcher timestamps the entire mitmdump stream, including addon records.
 logger = logging.getLogger(__name__)
-log_path = (
-    Path(os.getenv("KEY_INJECTOR_LOG", str(wd_path / "inject_keys.log")))
-    .expanduser()
-    .resolve()
-)
 logger.setLevel(logging.INFO)
-
-# mitmdump may configure the root logger before loading this addon, in which
-# case logging.basicConfig() does nothing. Attach a file handler directly to
-# this logger without replacing mitmdump's own handlers.
-if not any(
-    isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path
-    for handler in logger.handlers
-):
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s [KeyInjector]: %(message)s"
-        )
-    )
-    logger.addHandler(file_handler)
-
-
-logger.info(f"WD is {wd_path}")
-
-env_path = wd_path / ".env.guix-terminal-jail"
-if not env_path.exists():
-    logger.critical("No .env.guix-terminal-jail exists in WD.")
-    import sys
-
-    sys.exit(1)
-logger.info(f"Loading {env_path}")
-load_dotenv(dotenv_path=env_path)
+logger.propagate = False
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("[KeyInjector] %(levelname)s %(message)s"))
+logger.handlers[:] = [handler]
 
 
 @dataclass(frozen=True)
@@ -82,7 +51,7 @@ def load_header_mappings(
 
         for entry in entries:
             if not isinstance(entry, dict):
-                raise TypeError(f"Entries in '{section_name}.headers' must be tables")
+                raise TypeError(f"Entries in '{section_name}.headers' must be a table")
 
             host = entry.get("host")
             environment_variable = entry.get("environment_variable")
@@ -107,12 +76,15 @@ def load_header_mappings(
 
 class KeyInjector:
     def __init__(self) -> None:
-        configured_path = os.getenv("KEY_INJECTOR_CONFIG")
-        self.config_path = Path(
-            configured_path
-            if configured_path
-            else Path.home() / ".config" / "guix-terminal" / "key-injector.toml"
+        credentials_path = Path(os.environ["GUIX_JAIL_CREDENTIALS"])
+        with credentials_path.open(encoding="utf-8") as credentials:
+            self.credentials = dotenv_values(stream=credentials, interpolate=False)
+        configured_path = os.getenv("KEY_INJECTOR_CONFIG") or self.credentials.get("KEY_INJECTOR_CONFIG")
+        self.config_path = (
+            Path(configured_path).expanduser() if configured_path
+            else Path(os.environ["GUIX_JAIL_CONFIG_DIR"]) / "key-injector.toml"
         )
+        logger.info("Loading credentials from %s", credentials_path)
         self.mappings = load_header_mappings(self.config_path)
 
     def _find_mapping(
@@ -121,7 +93,8 @@ class KeyInjector:
         mappings: list[HeaderMapping],
     ) -> HeaderMapping | None:
         for mapping in mappings:
-            if host == mapping.host or host.endswith(f".{mapping.host}"):
+            # API keys are destination-specific: do not implicitly trust subdomains.
+            if host == mapping.host.lower().rstrip("."):
                 return mapping
 
         logger.debug(f"No header mapping matched host: {host}")
@@ -139,7 +112,7 @@ class KeyInjector:
         if not mapping:
             return
 
-        key = os.getenv(mapping.environment_variable)
+        key = self.credentials.get(mapping.environment_variable)
 
         if not key:
             logger.warning(
@@ -153,7 +126,10 @@ class KeyInjector:
         logger.info(f"Injected {mapping.environment_variable} into {header_name}")
 
     def request(self, flow: http.HTTPFlow) -> None:
-        host = flow.request.pretty_host
+        if flow.request.scheme != "https" or flow.request.port !=443:
+            return
+
+        host = flow.request.host.lower().rstrip(".")
         logger.info(f"Intercepted request to: {host}")
 
         self._inject_header(

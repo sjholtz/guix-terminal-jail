@@ -1,495 +1,452 @@
-# Guix Terminal Jail: Zero-Trust Runtime & Credential Isolation Proxy
+# Guix Terminal Jail
+
+Run an interactive shell or a Python agent in a GNU Guix container,
+with a writable workspace and a host-side mitmproxy addon that
+supplies API credentials to selected HTTPS destinations.
 
 **Author:** Steven J Holtz
 
-## Table of Contents
+The project provides two entry points:
 
-- [Overview](#org56322c6)
-- [Threat Model & Security Guarantees](#org1867b15)
-- [System Architecture](#orge838197)
-  - [ASCII Architecture Diagram](#org2eb0ebe)
-  - [Sequence Diagram](#orgbe49bc4)
-- [Component Breakdown](#org3b9b32f)
-- [Quickstart Guide](#org068bc01)
-  - [Prerequisites](#org743b0fd)
-  - [Installation & Setup](#orgd094fe3)
-  - [Configure Header Injection](#orgfec4133)
-  - [Usage & Command Options](#org8b688f0)
-- [Security & Key Management Best Practices](#org000cc92)
+- `guix-terminal-jail` opens Bash at `/workspace`.
+- `guix-agent-jail` runs a uv-managed Python application mounted
+  read-only at `/app`, with `/workspace` as its working directory.
 
-<a id="org56322c6"></a>
+Both launchers share the same workspace proxy, temporary container
+home, credential selection, logging, and cleanup code.
 
-## Overview
+## Dependencies
 
-This repository provides an enterprise-grade execution sandbox for
-autonomous AI agents. By combining GNU Guix containerization with
-host-side man-in-the-middle credential proxying, this setup
-establishes a strict zero-trust boundary around agent workloads.
+The host must run Linux with `/proc` and support `guix shell
+--container --emulate-fhs --network`. Install and configure [GNU
+Guix](https://guix.gnu.org/), including its daemon and permissions for
+container use, before launching a jail.
 
-When building or running LLM agents with code execution capabilities,
-prompt injection or unintended file modifications pose critical
-security threats. This project mitigates both unintended filesystem
-modifications and API key exfiltration:
+Required host tools:
 
-1. **Filesystem Containment**: The agent runs inside an isolated GNU
-   Guix File Hierarchy Standard (FHS) container. It has access only to
-   a dedicated project directory and an isolated temporary home
-   directory. Persistent tool state and shell histories are safely
-   vaulted in host state storage.
+| Dependency | Purpose |
+| --- | --- |
+| Bash | Launchers and shared shell code |
+| GNU Guix | Container construction and runtime packages |
+| Python 3.11+ | Project setup, logging, and TOML parsing |
+| mitmproxy (`mitmdump`) with Python 3.11+ and `python-dotenv` | Host-side HTTPS proxy and credential injection |
+| GNU coreutils, `awk`, `sed`, `tr` | Paths, hashing, state files, and templates |
+| `ss` (usually iproute2), `flock` (util-linux), `ps` (procps) | Proxy readiness checks, locking, and process tracking |
+| Git | Cloning this repository |
 
-2. **Credential Isolation**: Real API credentials never enter the
-   container environment. The agent is injected with dummy keys, while
-   outbound HTTPS traffic is transparently routed through an
-   automatically managed host-level proxy (`mitmproxy`) that injects
-   valid API keys on the fly.
+The instructions below use host-side `uv` to install mitmproxy with
+its addon dependency in the same Python environment. Another
+installation works if `mitmdump` can import `dotenv` and `tomllib`.
 
-3. **Multi-Terminal Workspace Sharing**: Multiple terminals opened in
-   the same workspace automatically attach to the same `mitmdump`
-   proxy and share the same container home environment. Workspace
-   proxy and state lifecycles are managed using reference counting so
-   terminals can shut down in any order.
+The container receives these packages through Guix automatically:
 
-<a id="org1867b15"></a>
-
-## Threat Model & Security Guarantees
-
-| Attack Vector | Vulnerability / Impact | Sandbox Mitigation Strategy |
-|---|---|---:|
-| Prompt Injection / Credential Theft | Agent reads `~/.env`, `OPENAI_API_KEY`, or history to leak keys. | Container only contains dummy key values. Real keys reside on the host. |
-| Arbitrary Host Modification | Agent modifies host configuration files (`~/.bashrc`, `/etc/`, etc.). | Container limited to `/workspace`, temporary home, uv cache directories. |
-| Data Exfiltration | Agent reads arbitrary files and transmits them externally. | Host filesystem is not available except project directory passed as an argument. |
-| MitM Interception Bypass | Agent bypasses HTTPS proxying or drops custom certificates. | `SSL_CERT_FILE` and `*_CA_BUNDLE` enforce trust in mitmproxy CA certificates. |
-| Cross-Session State Leakage | Stale file permissions or zombie sessions leak credentials/state. | Strict 700/600 permission vaulting and active process reference counting. |
-
-<a id="orge838197"></a>
-
-## System Architecture
-
-The following diagrams illustrate how outbound LLM API requests
-originate from within the container with dummy keys and are
-transparently authorized at the host proxy boundary across one or more
-active terminal sessions per workspace.
-
-<a id="org2eb0ebe"></a>
-
-### ASCII Architecture Diagram
-
-```
-    +------------------------------------------------------------------------------------------+
-    | HOST MACHINE                                                                             |
-    |                                                                                          |
-    |  +-------------------------------+             +-------------------------------------+   |
-    |  | .env.guix-terminal-jail       |             | mitmproxy (inject_keys.py)          |   |
-    |  | - HOST_OPENAI_API_KEY         |------------>| - Intercepts requests on port 8080  |   |
-    |  | - HOST_ANTHROPIC_API_KEY      |             | - Identifies target host domain     |   |
-    |  | - HOST_OLLAMA_API_KEY         |             | - Injects real API keys into header |   |
-    |  | - HOST_LANGSMITH_API_KEY      |             +------------------+------------------+   |
-    |  +-------------------------------+                                ^                      |
-    |                                                                   |                      |
-    |  +-------------------------------------------------------------+  | HTTPS                |
-    |  | GUIX CONTAINER ISOLATION (Workspace-Scoped)                 |  | (mitmproxy CA Trust) |
-    |  |                                                             |  |                      |
-    |  |  +-----------------------+    +--------------------------+  |  |                      |
-    |  |  | Term 1 / Term 2       |    | Shared Workspace Home    |  |  |                      |
-    |  |  | - Agent Process (uv)  |--->| - HTTP_PROXY=꞉PORT       |--+--+                      |
-    |  |  | - Operates on         |    | - OPENAI_KEY="dummy_key" |  |                         |
-    |  |  |   /workspace only     |    | - SSL_CERT_FILE set      |  |                         |
-    |  |  +-----------------------+    +--------------------------+  |                         |
-    |  |              |                                              |                         |
-    |  |              v                                              |                         |
-    |  |  +-----------------------+                                  |                         |
-    |  |  | Shared Directory      |                                  |                         |
-    |  |  | /workspace            |                                  |                         |
-    |  |  | (Host $PROJECT_DIR)   |                                  |                         |
-    |  |  +-----------------------+                                  |                         |
-    |  +-------------------------------------------------------------+                         |
-    +------------------------------------------------+-----------------------------------------+
-                                                     | Upstream HTTPS Request
-                                                     | with Valid Header
-                                                     v
-                                       +------------------------------+
-                                       | External Provider APIs       |
-                                       | - api.openai.com             |
-                                       | - api.anthropic.com          |
-                                       | - ollama.com                 |
-                                       | - api.smith.langchain.com    |
-                                       +------------------------------+
+```text
+gcc-toolchain uv python bash coreutils git findutils ncurses
+nss-certs less curl cmp grep zlib node sed util-linux nano
 ```
 
-<a id="orgbe49bc4"></a>
+The first launch will likely be slow as it may need to download or
+build packages. Guix package versions are selected by the host's
+configured channels; this project does not pin a channel revision.
 
-### Sequence Diagram
+## Installation
 
-```mermaid
-sequenceDiagram
-autonumber
-actor User as Host User / Shell
-participant Jail as guix-terminal-jail Script
-participant State as Host State (~/.config/guix-terminal/state)
-participant Proxy as Host mitmproxy (inject_keys.py)
-participant Container as Guix Container Sandbox
-participant API as External LLM API (OpenAI/Anthropic/Ollama/LangSmith)
-
-User->>Jail: Launch script with options (-m script, project_dir)
-Jail->>State: Hash project_dir & register client PID in WORKSPACE_STATE_DIR/clients
-alt First Terminal in Workspace
-Jail->>Proxy: Auto-spawn workspace mitmdump (port 8080+)
-Jail->>State: Seed shared workspace $HOME with global history
-else Secondary Terminal in Workspace
-Jail->>Proxy: Attach to existing workspace mitmdump
-end
-Jail->>Container: Launch container with shared workspace $HOME
-Container->>Proxy: HTTPS Request (Authorization: Bearer dummy_key)
-Proxy->>API: Inject real key & forward request
-API-->>Proxy: Return HTTP Response
-Proxy-->>Container: Forward Response
-User->>Jail: Exit / Ctrl+C
-Jail->>State: Unregister client PID
-alt Last Active Terminal in Workspace
-Jail->>State: Append & deduplicate history to global STATE_DIR
-Jail->>Proxy: Stop workspace mitmdump process
-Jail->>State: Clean up shared workspace home
-else Other Terminals Still Active
-Jail->>State: Keep mitmdump & shared $HOME running
-end
-Jail->>State: Enforce 700/600 permissions on STATE_DIR
-```
-
-<a id="org3b9b32f"></a>
-
-## Component Breakdown
-
-### 1. Container Jail Script (`guix-terminal-jail`)
-
-The shell launcher creates a lightweight, isolated GNU Guix container
-with FHS emulation and manages background dependencies:
-
-- **Command Line Interface**: Supports flexible flags for passing
-  custom mitmproxy scripts (`-m`) and specifying the target project
-  directory.
-
-- **Workspace Isolation & Deterministic Hashing**: Computes a SHA-256
-  hash of =PROJECT_DIR= to isolate states into dedicated directories
-  (`~/.config/guix-terminal/state/projects/`). Different project
-  workspaces run on independent proxy ports and maintain isolated
-  states.
-
-- **Singleton Proxy & Multi-Terminal Support**: Multiple shells opened
-  in the same workspace attach to the same workspace `mitmdump`
-  instance and share a single container home directory
-  (`$WORKSPACE_STATE_DIR/home`).
-
-- **Reference-Counted Session Tracking**: Tracks active client
-  terminal process IDs in `$WORKSPACE_STATE_DIR/clients/`. Terminals
-  can close in any order without disrupting active shells. The proxy
-  and shared home directory are shut down and cleaned up only when the
-  last active session in the workspace exits.
-
-- **Global History Vaulting & Synchronization**: Maintains global
-  command histories (`.bash_history`, `.python_history`, `.lesshst`)
-  in `~/.config/guix-terminal/state`. When the first session opens in a
-  workspace, it seeds the workspace home with global history. When the
-  last session exits, it appends workspace history back to the global
-  vault and de-duplicates `.bash_history` while preserving
-  chronological order.
-
-- **Strict Permission Vaulting**: Enforces `umask 077` and recursively
-  sets all state subdirectories to `700` (`rwx------`) and state files
-  to `600` (`rw-------`) on initialization and cleanup.
-
-- **Automated Proxy Lifecycle**: Dynamically finds an open port
-  (starting at port `8080`), spawns `mitmdump` bound strictly to
-  loopback (`127.0.0.1`), verifies health, and registers signal traps
-  to guarantee proxy cleanup upon exit.
-
-- **Package Manifest**: Provisions `gcc-toolchain`, `uv`, `python`,
-  `git`, `curl`, `nss-certs`, and common utilities.
-
-- **Mount Isolation**: Shares the project directory as `/workspace`,
-  creates an isolated temporary home directory, and mounts host cache
-  directories for `uv` (`.cache/uv`, `.local/share/uv`).
-
-- **Certificate Mount**: Exposes `$HOME/.mitmproxy` read-only so the
-  container can validate proxy TLS certificates.
-
-### 2. Mitmproxy Key Injector (`inject_keys.py`)
-
-A Python add-on for `mitmproxy` running on the host machine:
-
-- Intercepts outbound requests to supported provider domains
-  (`api.openai.com`, `api.anthropic.com`, `ollama.com`,
-  `api.smith.langchain.com`).
-
-- Loads header mappings from `~/.config/guix-terminal/key-injector.toml`.
-
-- Loads live environment secrets from `.env.guix-terminal-jail` located
-  in the parent directory of the current workspace.
-
-- Selects the appropriate header configuration based on the target
-  host and injects the corresponding API key.
-
-- Supports `Authorization` headers with optional prefixes such as
-  `Bearer = and =x-api-key` headers.
-
-- Supports an alternate TOML configuration path through a
-  `KEY_INJECTOR_CONFIG` environment variable.
-
-- Replaces or sets request headers and injects genuine API keys
-  dynamically.
-
-- Writes injector messages at `INFO` level and above to
-  `inject_keys.log`. The default path is the parent of the directory
-  from which `guix-terminal-jail` was launched. Set `KEY_INJECTOR_LOG` to
-  choose an explicit log-file path.
-
-- Uses a dedicated file handler rather than `logging.basicConfig`, so
-  file logging still works when `mitmdump` has already configured
-  Python's root logger.
-
-### 3. Container Shell Configuration (`bashrc`)
-
-The container shell template (`~/.config/guix-terminal/bashrc`):
-
-- Automatically receives the dynamically allocated proxy port via sed
-  substitution.
-
-- Exports dummy environment variables (`OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, etc.) to satisfy client library initialization
-  requirements.
-
-- Routes all network communication through `http://127.0.0.1:PORT` via
-  `HTTP_PROXY` and `HTTPS_PROXY`.
-
-- Explicitly points `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` to the
-  proxy certificate.
-
-These variables configure environment-aware HTTP clients. A client
-using a custom transport may ignore them; configure that client’s
-proxy explicitly (for example, `openai_proxy` with LangChain’s
-`ChatOpenAI`) if its API requests do not appear in the injector
-log. An example that uses this option:
-```python
-import os
-from langchain_openai import ChatOpenAI
-
-model = ChatOpenAI(
-    model="A_model_name",
-    openai_proxy=os.environ["HTTPS_PROXY"],
-)
-```
-
-<a id="org068bc01"></a>
-
-## Quickstart Guide
-
-<a id="org743b0fd"></a>
-
-### Prerequisites
-
-- [GNU Guix](https://guix.gnu.org/) installed on the host operating
-  system.
-
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-  installed on the host machine.
-
-Install `mitmproxy` version 10.1.2 or newer with `uv`. The injector
-imports `dotenv` with `from dotenv import load_dotenv`; the package
-that provides this module is named `python-dotenv`. Installing it as a
-mitmproxy tool dependency makes it available in the same isolated
-Python environment as `mitmdump`.
+### 1. Keep the complete project together
 
 ```bash
-uv tool install --with python-dotenv mitmproxy
+git clone https://github.com/sjholtz/guix-terminal-jail.git
+cd guix-terminal-jail
+chmod +x guix-terminal-jail guix-agent-jail
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/guix-terminal-jail" "$HOME/.local/bin/guix-terminal-jail"
+ln -s "$PWD/guix-agent-jail" "$HOME/.local/bin/guix-agent-jail"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add the PATH setting to your host shell configuration if
+necessary. Both launchers resolve symlinks to find their supporting
+files. Keep `lib/`, `inject_keys.py`, `environment.sh`, `bashrc`, and
+`.env.example` beside them; copying only the executable scripts is
+insufficient.
+
+In this working tree, `lib/` is ignored by `.gitignore`, and several
+runtime files (including `guix-agent-jail` and `environment.sh`) are
+not yet tracked. A clone of the committed files alone will be
+incomplete until those runtime files are included in the
+repository. The installation requires the complete layout described
+above.
+
+### 2. Install the host proxy
+
+With `uv` installed on the host:
+
+```bash
+uv tool install --python 3.11 --with python-dotenv mitmproxy
 uv tool update-shell
 ```
 
-Do not use a system-packaged `mitmproxy` for this setup. A package
-installed with `apt` may use a system Python environment that does not
-include `python-dotenv`. The `uv tool update-shell` command adds uv's
-tool executable directory to the shell configuration; open a new
-terminal or reload that configuration afterward.
+Reload your shell configuration or open a new terminal if needed, then
+check:
 
-Confirm the selected executable with `command -v mitmdump`. If needed,
-use `type -a mitmdump` to list all matching executables and adjust
-`PATH` so the uv-installed executable takes precedence.
-
-<a id="orgd094fe3"></a>
-
-### Installation & Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/sjholtz/guix-terminal-jail.git
-   cd guix-terminal-jail
-   ```
-
-2. Place the mitmproxy injector script in your home binary path and
-   place its configuration file in the default configuration directory:
-   ```bash
-   mkdir -p ~/bin
-   cp inject_keys.py ~/bin/
-   mkdir -p ~/.config/guix-terminal
-   cp key-injector.toml ~/.config/guix-terminal/
-   ```
-
-3. Configure host credentials:
-
-   Copy the example environment template to your project’s parent
-   directory:
-   ```bash
-   cp .env.example /<path>/.env.guix-terminal-jail
-   # Edit .env.guix-terminal-jail with your provider keys
-   ```
-
-   The `<path>` here must be to the *parent* directory of the project
-   directory that your agent code is in. For example, if your code is
-   in `/home/<user>/my-project/src/`, the `.env.guix-terminal-jail` file
-   must reside in `/home/<user>/my-project/`.
-
-   Edit the `.env.guix-terminal-jail` file with your live provider API
-   keys.
-
-   The configuration path override can also be placed in this file. For
-   example:
-   ```bash
-   KEY_INJECTOR_CONFIG=/home/<user>/.config/guix-terminal/key-injector.toml
-   ```
-
-4. Copy `bashrc` into user configuration directory:
-   ```bash
-   cp bashrc ~/.config/guix-terminal
-   ```
-
-<a id="orgfec4133"></a>
-
-### Configure Header Injection
-
-The injector reads provider mappings from
-`~/.config/guix-terminal/key-injector.toml` by default. This file
-contains no secrets; it simply maps target host URLs to environment
-variable names.
-
-To use a different configuration file, add it to the parent-directory
-`.env.guix-terminal-jail` file exactly as shown above, or export
-`KEY_INJECTOR_CONFIG=<path>/key-injector.toml` before launching the
-sandbox, as shown below:
 ```bash
-export KEY_INJECTOR_CONFIG=/path/to/key-injector.toml
+command -v guix python3 mitmdump ss flock ps
+python3 --version
+mitmdump --version
+```
+
+If you have multiple proxy installations, use `type -a mitmdump` to
+check which one the launcher will run.
+
+### 3. Install header mappings
+
+Run this from the repository directory:
+
+```bash
+config_base="${XDG_CONFIG_HOME:-$HOME/.config}"
+install -d -m 700 "$config_base/guix-terminal"
+install -m 600 key-injector.toml "$config_base/guix-terminal/key-injector.toml"
+```
+
+Use an absolute `XDG_CONFIG_HOME` if setting it explicitly. Shell and
+environment templates have bundled defaults and do not need to be
+copied.
+
+### 4. Configure credentials
+
+Create your workspace directory, then initialize its private
+credentials:
+
+```bash
+mkdir -p "$HOME/projects/my-workspace"
+guix-terminal-jail --init "$HOME/projects/my-workspace"
+```
+
+`--init` prints the resolved paths and creates a project-specific
+`credentials.env` from `.env.example` without overwriting an existing
+file. Edit the **Project credentials** path printed by the command and
+replace the placeholder values with the keys you need. Remove unused
+placeholders or leave those variables empty.
+
+Alternatively, install shared credentials from the repository
+directory:
+
+```bash
+install -m 600 .env.example "$config_base/guix-terminal/credentials.env"
+# Edit that file to supply your keys.
+```
+
+A project credentials file takes precedence over the shared file **as
+a whole**; values are not merged. Running `--init` therefore switches
+that workspace to its project-specific file, even if shared
+credentials already exist.
+
+Credentials are read from the selected file, not from exported
+`HOST_*` variables. Dotenv interpolation is disabled. The old
+parent-directory `.env.guix-terminal-jail` location is no longer read.
+
+### 5. Start a jail
+
+```bash
+guix-terminal-jail "$HOME/projects/my-workspace"
+```
+
+On first use, mitmproxy generates its CA files under the host's
+`~/.mitmproxy`. The launcher exposes only `mitmproxy-ca-cert.cer` to
+the container. The environment template combines it with Guix's public
+CA bundle.
+
+## Interactive shell usage
+
+```text
+guix-terminal-jail [--paths | --init] [-h] [-m inject_keys_path] [-p pnpm_host_path] [project_dir]
+```
+
+| Option | Behavior |
+| --- | --- |
+| `project_dir` | Workspace directory; defaults to the current directory |
+| `--paths` | Print paths without creating files or starting Guix/proxy processes |
+| `--init` | Create missing project credentials and prepare project state, then print paths |
+| `-m PATH` | Select a host mitmproxy addon; defaults to bundled `inject_keys.py` |
+| `-p DIR` | Select a host pnpm directory; defaults to `~/.local/share/pnpm` |
+| `-h`, `--help` | Show help |
+
+For example:
+
+```bash
+cd "$HOME/projects/my-workspace"
+guix-terminal-jail --paths
 guix-terminal-jail
 ```
 
-The `key-injector.toml` file looks like this:
-```toml
-[auth]
+The `--paths` option will show you where important files are located
+and how external paths are mapped internally.
 
+Inside the shell, the workspace is `/workspace`. Run your normal
+development commands there, such as `uv sync` or `uv run python
+main.py`. Type `exit` to leave; the bundled Bash configuration ignores
+Ctrl+D.
+
+Opening another jail for the same canonical workspace path reuses the
+same proxy and container home, so 2 or more terminals can be opened to
+the same contained environment. Each launch still creates its own Guix
+container. Separate workspaces use separate state and proxies.
+
+If the selected pnpm directory exists, it is mounted read-only at
+`/host-pnpm`, and `/host-pnpm/bin` is added to PATH. pnpm is optional
+and is not installed by these scripts.
+
+## Python agent usage
+
+```text
+guix-agent-jail [options] [workspace_dir] [-- agent_args...]
+```
+
+| Option | Behavior |
+| --- | --- |
+| `-a DIR`, `--app DIR` | Application directory; defaults to `GUIX_AGENT_APP_DIR` |
+| `-e FILE`, `--entry FILE` | Python script relative to the application; defaults to `main.py` |
+| `--paths`, `--init` | Same workspace actions as the terminal launcher; no application required |
+| `-m PATH`, `-p DIR` | Same addon and pnpm settings as the terminal launcher |
+| `-h`, `--help` | Show help |
+
+The application needs `pyproject.toml` with `[project].name`, a
+committed `uv.lock`, and the entry script. The application and
+workspace must be separate: neither directory may contain the
+other. The entry must resolve to a file inside the application
+directory.
+
+```bash
+# Application code lives outside the writable workspace.
+guix-agent-jail --app "$HOME/bin/myagent" "$HOME/projects/my-workspace"
+
+# Select a different entry and pass arguments to it.
+guix-agent-jail --app "$HOME/bin/myagent" --entry scripts/run.py \
+  "$HOME/projects/my-workspace" -- --verbose
+
+# Or configure a default application for this host shell.
+export GUIX_AGENT_APP_DIR="$HOME/bin/myagent"
+guix-agent-jail "$HOME/projects/my-workspace" -- --verbose
+```
+
+For each application/workspace pair, the launcher:
+
+1. Mounts the application read-only at `/app` and persistent
+   application state at `/agent-state`.
+2. Acquires a lock for the entire setup and run. Concurrent runs of
+   the same pair wait; different pairs have separate locks.
+3. Stages a writable application copy under `/agent-state/source`,
+   excluding `.venv` and `__pycache__`, for build backends that write
+   metadata.
+4. Runs `uv sync --frozen --no-editable` with the virtual environment
+   at `/agent-state/venv`. Source changes refresh the copy and trigger
+   reinstallation of local packages.
+5. Runs `uv run --project /agent-state/source --frozen --no-sync
+   python /app/<entry>` with the supplied arguments and `/workspace`
+   as the working directory.
+
+Application state survives normal shutdown. Python bytecode is
+redirected to temporary container storage. Dependencies must work with
+the container's available tools and mounts; host paths outside the
+exposed directories are unavailable.
+
+## Credential injection
+
+The bundled mappings are:
+
+| Exact destination host | Header | Credentials file variable |
+| --- | --- | --- |
+| `api.openai.com` | `Authorization: Bearer …` | `HOST_OPENAI_API_KEY` |
+| `ollama.com` | `Authorization: Bearer …` | `HOST_OLLAMA_API_KEY` |
+| `api.githubcopilot.com` | `Authorization: Bearer …` | `HOST_GITHUB_API_KEY` |
+| `api.anthropic.com` | `x-api-key` | `HOST_ANTHROPIC_API_KEY` |
+| `api.smith.langchain.com` | `x-api-key` | `HOST_LANGSMITH_API_KEY` |
+
+Add `HOST_GITHUB_API_KEY` yourself if needed; it is not in
+`.env.example`. The example also contains `HOST_GOOGLE_API_KEY`, but
+there is no bundled Google mapping.
+
+The injector only modifies HTTPS requests on port 443. Host matching
+is exact after lowercasing and removing a trailing dot; subdomains do
+not match automatically. A matching header is replaced or
+added. Missing or empty keys produce a warning and leave the request
+header unchanged.
+
+Customize `key-injector.toml` using these two supported sections:
+
+```toml
 [[auth.headers]]
 host = "api.openai.com"
 environment_variable = "HOST_OPENAI_API_KEY"
 
-[[auth.headers]]
-host = "ollama.com"
-environment_variable = "HOST_OLLAMA_API_KEY"
-
-[x-api]
-
 [[x-api.headers]]
 host = "api.anthropic.com"
 environment_variable = "HOST_ANTHROPIC_API_KEY"
-
-[[x-api.headers]]
-host = "api.smith.langchain.com"
-environment_variable = "HOST_LANGSMITH_API_KEY"
 ```
 
-The `[auth]` section injects the `Authorization` header. The `[x-api]`
-section injects the `x-api-key` header. Host matching supports an exact
-domain or a subdomain.
+`auth` always supplies the `Bearer ` prefix; `x-api` supplies the raw
+value. Set `KEY_INJECTOR_CONFIG` in the host environment or selected
+credentials file to use another TOML file. The host environment takes
+precedence. Use an absolute path for predictable resolution.
 
-Python 3.11 or newer is required because the loader uses the standard
-library `tomllib` module.
+Credentials and mappings load when the proxy starts. Close all
+sessions for the workspace and relaunch after editing them. An active
+proxy rejects attempts to attach using a different addon,
+credential-file path, or config override.
 
-The user should edit this file as needed to add or remove hosts that
-need API key access from within the container.
+## Configuration, state, and logs
 
-<a id="org8b688f0"></a>
+Absolute XDG base paths are honored. Unset or relative values fall
+back to the following defaults:
 
-### Usage & Command Options
+```text
+~/.config/guix-terminal/
+  key-injector.toml
+  credentials.env                  # optional shared credentials
+  bashrc                           # optional interactive shell override
+  environment.sh                   # optional environment override
+  projects/<project-id>/
+    project_path
+    credentials.env                # optional project credentials
 
-The sandbox launcher automatically starts and stops `mitmdump` in the
-background.
-
-```bash
-guix-terminal-jail [-h] [-m inject_keys_path] [project_dir]
+~/.local/state/guix-terminal/projects/<project-id>/
+  project_path
+  mitmdump.log
+  workspace.lock
+  mitmdump.pid / mitmdump.start / mitmdump.port / proxy_config
+  clients/
+  home/                            # exists while workspace sessions are active
+  bash_history / lesshst / python_history
+  apps/<application-hash>/          # persistent source copy, venv, and run lock
 ```
 
-#### Arguments & Options
+The project ID combines a sanitized directory name and the first 12
+characters of the SHA-256 hash of its canonical absolute
+path. Application state uses a hash of the application's canonical
+path. Moving either directory changes its identity.
 
-- `-h`: Display usage information and exit.
-- `-m inject_keys_path`: Path to the mitmproxy Python
-  script. (Default: `$HOME/bin/inject_keys.py`).
-- `project_dir`: Path to the Python project directory that will be
-  accessible inside the Guix container. (Default: current working
-  directory).
+Use `--paths` to find the actual locations. `mitmdump.log` combines
+timestamped launcher events and proxy stdout/stderr, including
+injector messages. It replaces the old standalone `inject_keys.log`;
+`KEY_INJECTOR_LOG` is not used by the current code. The log is
+appended and is not automatically rotated.
 
-#### Examples
+Launchers use `umask 077`; existing files and directories are not
+recursively reset to private permissions. Keep credentials, state, and
+logs private.
 
-- Launching from your project directory:
-  ```bash
-  cd /home/<user>/project_dir/src/
-  guix-terminal-jail
-  ```
+On normal last-session exit, the launcher stops the workspace proxy,
+copies supported histories into that workspace's state, and removes
+the shared container home. Other home-directory changes are
+discarded. Histories are per workspace; there is no global history
+merge or deduplication. HUP, INT, and TERM are forwarded through the
+container process tree before cleanup.
 
-- Opening a second terminal in the same workspace (attaches to
-  existing proxy & container home):
-  ```bash
-  # In terminal 2:
+Idle legacy state under
+`~/.config/guix-terminal/state/projects/<full-hash>` is migrated
+during initialization or launch. Active legacy sessions must be closed
+first. Conflicting legacy and current state causes an error for manual
+resolution. Cross-filesystem migration retains the original as a
+backup.
 
-  cd /home/<user>/project_dir/src/
-  guix-terminal-jail
-  ```
+## Container environment and access
 
-- Specifying a project directory explicitly:
-  ```bash
-  guix-terminal-jail /home/<user>/my-project/src/
-  ```
+| Host resource | Container location | Access |
+| --- | --- | --- |
+| Selected workspace | `/workspace` | Read/write |
+| Workspace's temporary home | Host user's home path inside container | Read/write |
+| `~/.cache/uv`, `~/.local/share/uv` | Same paths inside container | Read/write, shared across workspaces |
+| `~/.mitmproxy/mitmproxy-ca-cert.cer` | Same path inside container | Read-only |
+| Bundled `lib/` | `/run/guix-jail` | Read-only |
+| Optional host pnpm directory | `/host-pnpm` | Read-only |
+| Agent application | `/app` | Read-only, agent launcher only |
+| Application/workspace state | `/agent-state` | Read/write, agent launcher only |
 
-- Specifying a non-default location for mitmproxy key injector script:
-  ```bash
-  guix-terminal-jail -m /custom/path/inject_keys.py
-  ```
+The launchers reject mount sources that overlap the host's default or
+configured configuration directory, including ancestors such as the
+entire host home. Mount sources containing `=` are also rejected.
 
-#### Injector Log
+`environment.sh` configures lowercase and uppercase proxy variables,
+localhost proxy exclusions, dummy OpenAI/Anthropic/Ollama/LangSmith
+keys, and CA variables for Python, requests, curl, Git, and Node. Its
+default LangSmith tracing setting is `false`. The bundled interactive
+`bashrc` also sets proxy and CA variables and changes LangSmith
+tracing to `true`, with project `lca-deepagents`. Customize both
+templates if you need consistent interactive and agent settings. Both
+support the launcher's `#PORT#` substitution.
 
-The injector writes `INFO` and higher severity messages to
-`inject_keys.log`. By default, this file is associated with the
-project and is placed in the parent of the directory from which the
-launcher was started. To select a fixed path, set `KEY_INJECTOR_LOG`
-in the host environment before launching the jail:
-```bash
-export KEY_INJECTOR_LOG="$HOME/.local/state/guix-terminal/inject_keys.log"
-guix-terminal-jail
-```
+## Isolation limits
 
-If the log file is absent, first check the resolved path and confirm
-that `mitmdump` is the `uv` installation as described above.
+The container limits filesystem access to Guix runtime resources and
+the mounts described above. The bundled injector keeps its real
+credential file on the host and supplies credentials at the proxy
+boundary. Keep secrets out of the workspace, application source,
+shared caches, pnpm directory, and custom container templates.
 
-<a id="org000cc92"></a>
+Networking is shared with the host through `--network`. Proxy
+environment variables configure cooperative clients; they do **not**
+enforce proxy use, block direct connections, or prevent access to host
+loopback services. CA settings establish trust and do not enforce
+traffic routing. Files readable in the container can be sent over the
+network.
 
-## Security & Key Management Best Practices
+The default injector is not a request allowlist or spending control: a
+process can make authenticated requests to mapped providers through
+the proxy. Other local processes able to reach the loopback proxy may
+also use it. Containers and caches are not isolated from other
+sessions running as the same host user. Protect the host mitmproxy CA
+private key; only its public certificate is mounted by the launcher.
 
-- **Repository Sanitation**: Never commit `.env.guix-terminal-jail` or
-  live secrets. Keep `.env.guix-terminal-jail` listed in your project’s
-  `.gitignore`.
+`agent-guardrails.py` is a separate example addon with a route
+allowlist and a 100-request budget per addon instance. Selecting it
+with `-m` **replaces** credential injection; it is not enabled or
+combined with the injector automatically, and it only sees traffic
+sent through the proxy.
 
-- **Certificate Security**: Treat the generated
-  `mitmproxy-ca-cert.pem` certificate securely, as it permits local
-  decryption of container-initiated TLS traffic.
+## Example Use
 
-- **State File Permissions**: All files under
-  `~/.config/guix-terminal/state` are strictly vault-protected with
-  `600` permissions for files and `700` for directories to ensure no
-  unprivileged local processes can read history or socket state.
+An example use would be executing your own custom coding agent
+(located in the app directory, e.g. `~/bin/myagent`) on project code
+that is located in the workspace path
+(e.g. `"$HOME/projects/my-workspace"`). This provides the ability to
+securely execute your custom agent on a subset of your filesystem and
+have the confidence that that agent will not run over your important
+files or exfiltrate your secrets.
 
-- **Key Rotation**: If keys are exposed or compromised during
-  development, immediately revoke them in your API provider dashboard
-  and generate new keys.
+## Troubleshooting
+
+- **Missing credentials:** run `--paths`, then initialize project
+  credentials with `--init` or install the shared
+  file. Parent-directory dotenv files and exported `HOST_*` keys are
+  not credential sources.
+- **Proxy cannot start:** inspect the printed workspace log. The
+  launcher tries only loopback ports **8080–8089** and verifies that
+  the started process owns the listener. Check for occupied ports,
+  addon import errors, and missing or invalid TOML.
+- **`No module named dotenv`:** ensure the selected `mitmdump`
+  installation includes `python-dotenv`, as shown above.
+- **TLS errors:** check the host CA certificate and your
+  `environment.sh`/`bashrc` overrides. Certificate-pinning clients may
+  reject proxy interception.
+- **API requests missing from the proxy log:** the client may ignore
+  proxy environment variables. Configure its transport
+  explicitly. Merely setting a CA bundle does not route traffic
+  through the proxy.
+- **Mount rejected:** choose a workspace/application outside host
+  configuration directories. Do not select the entire host home as the
+  workspace.
+- **Agent appears to wait:** another run may hold the lock for that
+  application/workspace pair.
+- **Changes to credentials have no effect:** close every jail for the
+  workspace so its proxy exits, then restart.
+
+## Project files
+
+The root launchers and `lib/` implement the current
+runtime. `inject_keys.py` is the default host addon;
+`key-injector.toml` supplies mappings; `.env.example` supplies the
+credential template; `bashrc` and `environment.sh` configure container
+sessions.
+
+## License
+
+See [LICENSE](LICENSE) for the GNU General Public License, version 3.

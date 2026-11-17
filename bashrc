@@ -134,9 +134,9 @@ fi
 export TERM=xterm-256color
 # export FCEDIT="emacsclient -c"
 
-# export EDITOR="emacsclient"
+export EDITOR="nano"
 # export GIT_EDITOR="emacsclient"
-# export VISUAL="emacsclient"
+export VISUAL="nano"
 # export ALTERNATE_EDITOR="emacs -Q"
 
 # # For dcraw_emu (and prehaps others...):

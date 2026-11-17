@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+JAIL_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+source "$JAIL_DIR/lib/jail-common.sh"
+
+usage() {
+    cat <<'USAGE'
+Usage: guix-agent-jail [options] [workspace_dir] [-- agent_args...]
+
+Run a uv-managed Python application with its working directory at /workspace.
+The workspace defaults to the current directory.
+
+Options:
+  --paths           Show project paths without starting a jail.
+  --init            Initialize private project credentials and show paths.
+  -a, --app DIR     Application directory (default: GUIX_AGENT_APP_DIR).
+  -e, --entry FILE  Python script relative to the application (default: main.py).
+  -m PATH          Host mitmproxy addon (default: bundled inject_keys.py).
+  -p DIR           Host pnpm directory (default: ~/.local/share/pnpm).
+  -h, --help       Show this help.
+
+The application must contain pyproject.toml and uv.lock. Its source is mounted
+read-only at /app. A persistent virtual environment is stored per application
+and workspace. Runs using the same pair wait for each other to finish.
+
+Examples:
+  guix-agent-jail --app ~/bin/myagent ~/project
+  guix-agent-jail --app ~/bin/myagent . -- --verbose
+  GUIX_AGENT_APP_DIR=~/bin/myagent guix-agent-jail ~/project
+USAGE
+}
+
+APP_DIR=${GUIX_AGENT_APP_DIR:-}
+ENTRY=main.py
+PROJECT_ARG=
+AGENT_ARGS=()
+while (( $# )); do
+    case $1 in
+        --paths|--init)
+            [[ $ACTION == run ]] || die "Choose one project action."
+            ACTION=${1#--}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -a|--app|-e|--entry|-m|-p)
+            (( $# >= 2 )) || die "Missing value for $1"
+            [[ -n $2 ]] || die "Empty value for $1"
+            case $1 in
+                -a|--app) APP_DIR=$2 ;;
+                -e|--entry) ENTRY=$2 ;;
+                -m) MITM_SCRIPT=$2 ;;
+                -p) PNPM_HOST_PATH=$2 ;;
+            esac
+            shift 2
+            ;;
+        --) shift; AGENT_ARGS=("$@"); break ;;
+        -*) die "Unknown option: $1" ;;
+        *)
+            [[ -z $PROJECT_ARG ]] || die "Use -- before arguments for the agent."
+            PROJECT_ARG=$1
+            shift
+            ;;
+    esac
+done
+
+handle_workspace_action "${PROJECT_ARG:-$PWD}"
+
+[[ -n $APP_DIR ]] || die "Specify --app DIR or set GUIX_AGENT_APP_DIR."
+APP_DIR=$(realpath -e -- "$APP_DIR")
+[[ -d $APP_DIR ]] || die "Application directory does not exist: $APP_DIR"
+# resolve_workspace() has already canonicalized PROJECT_DIR. Neither root
+# may contain the other: /workspace is writable, while /app is read-only.
+if [[ $APP_DIR == "$PROJECT_DIR" ||
+      $APP_DIR == "$PROJECT_DIR/"* ||
+      $PROJECT_DIR == "$APP_DIR/"* ]]; then
+    die "Application and workspace directories must not overlap."
+fi
+check_mount_source "$APP_DIR"
+for name in pyproject.toml uv.lock; do
+    [[ -r $APP_DIR/$name ]] || die "Application requires $APP_DIR/$name"
+done
+[[ $ENTRY != /* ]] || die "--entry must be relative to the application directory."
+ENTRY_PATH=$(realpath -e -- "$APP_DIR/$ENTRY")
+[[ $ENTRY_PATH == "$APP_DIR/"* && -f $ENTRY_PATH ]] ||
+    die "Entry script must be a file inside the application directory."
+ENTRY=${ENTRY_PATH#"$APP_DIR/"}
+
+APP_HASH=$(printf '%s' "$APP_DIR" | sha256sum | awk '{print $1}')
+APP_STATE_DIR="$WORKSPACE_STATE_DIR/apps/$APP_HASH"
+check_mount_source "$APP_STATE_DIR"
+init_workspace
+mkdir -p -- "$APP_STATE_DIR"
+app_record=$(mktemp -- "$APP_STATE_DIR/.app-path.XXXXXXXX")
+printf '%s\n' "$APP_DIR" > "$app_record"
+mv -fT -- "$app_record" "$APP_STATE_DIR/app_path"
+start_workspace
+build_guix_args
+add_mount expose "$APP_DIR" /app
+add_mount share "$APP_STATE_DIR" /agent-state
+run_container bash /run/guix-jail/run-agent.sh "$ENTRY" "${AGENT_ARGS[@]}"
