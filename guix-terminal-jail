@@ -7,12 +7,13 @@ source "$JAIL_DIR/lib/jail-common.sh"
 
 usage() {
     cat <<'USAGE'
-Usage: guix-terminal-jail [--paths | --init] [-h] [-m inject_keys_path] [-p pnpm_host_path] [project_dir]
+Usage: guix-terminal-jail [options] [project_dir]
 
 Open an interactive Bash shell at /workspace.
 project_dir defaults to the current working directory.
 --paths shows project paths without starting a jail.
 --init creates private project credentials if missing, then shows paths.
+--add-package PACKAGE adds a Guix package to this container (repeatable).
 -m selects a host mitmproxy addon (default: bundled inject_keys.py).
 -p selects a host pnpm directory (default: ~/.local/share/pnpm).
 USAGE
@@ -24,6 +25,10 @@ while getopts "hm:p:-:" opt; do
             case "$OPTARG" in
                 paths|init) [[ $ACTION == run ]] || die "Choose one project action."; ACTION=$OPTARG ;;
                 help) usage; exit 0 ;;
+                add-package)
+                    add_package "${!OPTIND-}"
+                    ((OPTIND += 1))
+                    ;;
                 *) die "Unknown option: --$OPTARG" ;;
             esac ;;
         h) usage; exit 0 ;;

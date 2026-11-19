@@ -13,13 +13,14 @@ Run a uv-managed Python application with its working directory at /workspace.
 The workspace defaults to the current directory.
 
 Options:
-  --paths           Show project paths without starting a jail.
-  --init            Initialize private project credentials and show paths.
-  -a, --app DIR     Application directory (default: GUIX_AGENT_APP_DIR).
-  -e, --entry FILE  Python script relative to the application (default: main.py).
-  -m PATH          Host mitmproxy addon (default: bundled inject_keys.py).
-  -p DIR           Host pnpm directory (default: ~/.local/share/pnpm).
-  -h, --help       Show this help.
+  --paths                  Show project paths without starting a jail.
+  --init                   Initialize private project credentials and show paths.
+  -a, --app DIR            Application directory (default: GUIX_AGENT_APP_DIR).
+  -e, --entry FILE         Python script relative to the application (default: main.py).
+  --add-package PACKAGE    Add a Guix package to this container (repeatable).
+  -m PATH                  Host mitmproxy addon (default: bundled inject_keys.py).
+  -p DIR                   Host pnpm directory (default: ~/.local/share/pnpm).
+  -h, --help               Show this help.
 
 The application must contain pyproject.toml and uv.lock. Its source is mounted
 read-only at /app. A persistent virtual environment is stored per application
@@ -42,6 +43,10 @@ while (( $# )); do
             [[ $ACTION == run ]] || die "Choose one project action."
             ACTION=${1#--}; shift ;;
         -h|--help) usage; exit 0 ;;
+        --add-package)
+            add_package "${2-}"
+            shift 2
+            ;;
         -a|--app|-e|--entry|-m|-p)
             (( $# >= 2 )) || die "Missing value for $1"
             [[ -n $2 ]] || die "Empty value for $1"

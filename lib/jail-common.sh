@@ -4,11 +4,17 @@ source "$JAIL_DIR/lib/project-layout.sh"
 ACTION=run
 MITM_SCRIPT="$JAIL_DIR/inject_keys.py"
 PNPM_HOST_PATH="$HOME/.local/share/pnpm"
+ADDITIONAL_PACKAGES=()
 CONTAINER_PID=""
 
 die() {
     echo "Error: $*" >&2
     exit 1
+}
+
+add_package() {
+    [[ -n $1 && $1 != -* ]] || die "Expected a Guix package after --add-package."
+    ADDITIONAL_PACKAGES+=("$1")
 }
 
 init_workspace() {
@@ -268,7 +274,7 @@ run_container() {
     guix "${GUIX_ARGS[@]}" \
         gcc-toolchain uv python bash coreutils git findutils ncurses \
         nss-certs less curl cmp grep zlib node sed util-linux nano \
-        -- "$@" <&0 9>&- &
+        "${ADDITIONAL_PACKAGES[@]}" -- "$@" <&0 9>&- &
     CONTAINER_PID=$!
     wait "$CONTAINER_PID" || status=$?
     CONTAINER_PID=""

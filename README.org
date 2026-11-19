@@ -97,6 +97,7 @@ active terminal sessions per workspace.
 
 ** Sequence Diagram
 
+#+header: :tangle "./images/terminal-jail-sequence.mmd"
 #+begin_src mermaid
 sequenceDiagram
 autonumber

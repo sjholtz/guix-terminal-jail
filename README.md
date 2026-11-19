@@ -158,7 +158,7 @@ CA bundle.
 ## Interactive shell usage
 
 ```text
-guix-terminal-jail [--paths | --init] [-h] [-m inject_keys_path] [-p pnpm_host_path] [project_dir]
+guix-terminal-jail [options] [project_dir]
 ```
 
 | Option | Behavior |
@@ -166,6 +166,7 @@ guix-terminal-jail [--paths | --init] [-h] [-m inject_keys_path] [-p pnpm_host_p
 | `project_dir` | Workspace directory; defaults to the current directory |
 | `--paths` | Print paths without creating files or starting Guix/proxy processes |
 | `--init` | Create missing project credentials and prepare project state, then print paths |
+| `--add-package PACKAGE` | Add a Guix package for this launch. Repeat for each additional package. |
 | `-m PATH` | Select a host mitmproxy addon; defaults to bundled `inject_keys.py` |
 | `-p DIR` | Select a host pnpm directory; defaults to `~/.local/share/pnpm` |
 | `-h`, `--help` | Show help |
@@ -206,6 +207,7 @@ guix-agent-jail [options] [workspace_dir] [-- agent_args...]
 | `-a DIR`, `--app DIR` | Application directory; defaults to `GUIX_AGENT_APP_DIR` |
 | `-e FILE`, `--entry FILE` | Python script relative to the application; defaults to `main.py` |
 | `--paths`, `--init` | Same workspace actions as the terminal launcher; no application required |
+| `--add-package PACKAGE` | Add a Guix package for this launch. Repeat for each additional package. |
 | `-m PATH`, `-p DIR` | Same addon and pnpm settings as the terminal launcher |
 | `-h`, `--help` | Show help |
 
@@ -248,6 +250,26 @@ Application state survives normal shutdown. Python bytecode is
 redirected to temporary container storage. Dependencies must work with
 the container's available tools and mounts; host paths outside the
 exposed directories are unavailable.
+
+## Adding Guix packages
+
+Both launchers accept one Guix package specification per
+`--add-package` option. Put the options before the workspace path.
+Guix adds the requested packages alongside the default packages for
+that container launch.
+
+For an agent that needs to compile LaTeX documents to PDF:
+
+```bash
+guix-agent-jail --app "$HOME/bin/myagent" \
+  --add-package texlive-latexmk \
+  --add-package texlive-latex-fonts \
+  --add-package texlive-collection-latexrecommended \
+  "$HOME/projects/my-workspace"
+```
+
+Use the same options with `guix-terminal-jail` to compile manually.
+Inside the jail, run `latexmk -pdf main.tex` from the document directory.
 
 ## Credential injection
 
