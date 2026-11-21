@@ -272,7 +272,7 @@ run_container() {
     # Retain the caller's stdin explicitly for the asynchronous child.
     # The parent owns the workspace lock descriptor; the child closes it.
     guix "${GUIX_ARGS[@]}" \
-        gcc-toolchain uv python bash coreutils git findutils ncurses \
+        gcc-toolchain uv python bash coreutils git findutils ncurses tar gzip gawk \
         nss-certs less curl cmp grep zlib node sed util-linux nano \
         "${ADDITIONAL_PACKAGES[@]}" -- "$@" <&0 9>&- &
     CONTAINER_PID=$!
