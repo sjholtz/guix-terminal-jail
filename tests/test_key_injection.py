@@ -35,8 +35,6 @@ class KeyInjectionTests(unittest.TestCase):
         http = ModuleType("mitmproxy.http")
         vars(http)["HTTPFlow"] = type("HTTPFlow", (), {})
         vars(mitmproxy)["http"] = http
-        # http.HTTPFlow = type("HTTPFlow", (), {})
-        # mitmproxy.http = http
         spec = importlib.util.spec_from_file_location(
             "guix_key_injector_offline_tests", ROOT / "inject_keys.py"
         )

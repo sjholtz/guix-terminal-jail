@@ -6,9 +6,8 @@ import re
 import shutil
 import stat
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 
 def ignored(directory, names):

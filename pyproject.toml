@@ -1,15 +1,16 @@
 [project]
 name = "guix-terminal-jail"
 version = "0.1.0"
-description = "An set of Guix-based containers."
+description = "A collection of Guix-based container launchers."
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = "==3.13.*"
 dependencies = [
     "python-dotenv>=1.2.4",
 ]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.16.10",
-    "ty>=0.0.109",
+    "ruff==0.17.6",
+    "ty==0.0.109",
+    "mitmproxy==12.3.1",
 ]

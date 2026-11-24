@@ -1,9 +1,9 @@
 import logging
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-import tomllib
 from dotenv import dotenv_values
 from mitmproxy import http
 
