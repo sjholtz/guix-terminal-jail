@@ -223,3 +223,6 @@ Notes.org
 # Project files
 !.env.example
 credentials.env
+patches/
+postings/
+images/
