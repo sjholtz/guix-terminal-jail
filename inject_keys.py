@@ -79,9 +79,12 @@ class KeyInjector:
         credentials_path = Path(os.environ["GUIX_JAIL_CREDENTIALS"])
         with credentials_path.open(encoding="utf-8") as credentials:
             self.credentials = dotenv_values(stream=credentials, interpolate=False)
-        configured_path = os.getenv("KEY_INJECTOR_CONFIG") or self.credentials.get("KEY_INJECTOR_CONFIG")
+        configured_path = os.getenv("KEY_INJECTOR_CONFIG") or self.credentials.get(
+            "KEY_INJECTOR_CONFIG"
+        )
         self.config_path = (
-            Path(configured_path).expanduser() if configured_path
+            Path(configured_path).expanduser()
+            if configured_path
             else Path(os.environ["GUIX_JAIL_CONFIG_DIR"]) / "key-injector.toml"
         )
         logger.info("Loading credentials from %s", credentials_path)
@@ -126,7 +129,7 @@ class KeyInjector:
         logger.info(f"Injected {mapping.environment_variable} into {header_name}")
 
     def request(self, flow: http.HTTPFlow) -> None:
-        if flow.request.scheme != "https" or flow.request.port !=443:
+        if flow.request.scheme != "https" or flow.request.port != 443:
             return
 
         host = flow.request.host.lower().rstrip(".")

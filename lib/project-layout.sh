@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Compute paths without creating files or requiring Guix.
 resolve_workspace() {
     local config_base=${XDG_CONFIG_HOME:-} state_base=${XDG_STATE_HOME:-} name
@@ -43,8 +44,16 @@ prepare_layout() {
 handle_workspace_action() {
     resolve_workspace "$1"
     case $ACTION in
-        paths) show_paths; exit 0 ;;
-        init) prepare_layout init; CREDENTIALS_FILE=$PROJECT_ENV; show_paths; exit 0 ;;
+        paths)
+            show_paths
+            exit 0
+            ;;
+        init)
+            prepare_layout init
+            CREDENTIALS_FILE=$PROJECT_ENV
+            show_paths
+            exit 0
+            ;;
     esac
 }
 
@@ -53,7 +62,7 @@ check_mount_source() {
     path=$(realpath -m -- "$1") || return 1
     for protected in "$HOME/.config" "$(realpath -m -- "$HOME/.config")" "$CONFIG_BASE"; do
         if [[ $path == / || $protected == / || $path == "$protected" ||
-              $path == "$protected/"* || $protected == "$path/"* ]]; then
+            $path == "$protected/"* || $protected == "$path/"* ]]; then
             die "Mount would expose host configuration: $path"
         fi
     done

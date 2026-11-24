@@ -1,0 +1,131 @@
+name: CI
+
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+
+# All checks are read-only; no secrets or write permissions are required.
+permissions:
+    contents: read
+
+jobs:
+    python:
+        name: Python (Ruff, ty, unittest)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out source
+              uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Set up Python
+              uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+              with:
+                  python-version: '3.12'
+
+            - name: Install pinned tools and Python runtime dependencies
+              run: |
+                  python -m pip install \
+                      ruff==0.16.10 \
+                      ty==0.0.109 \
+                      mitmproxy==12.3.1 \
+                      python-dotenv==1.2.4
+
+            - name: Ruff formatting
+              run: ruff format --check .
+
+            - name: Ruff linting
+              run: ruff check .
+
+            - name: ty static type checking
+              run: ty check .
+
+            - name: Offline regression tests
+              run: python -m unittest discover -s tests -v
+
+    bash:
+        name: Bash (shfmt, ShellCheck, bash -n)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out source
+              uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Install pinned shfmt and ShellCheck
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p "$RUNNER_TEMP/ci-tools"
+                  curl --fail --location --silent --show-error --retry 3 \
+                      -o "$RUNNER_TEMP/ci-tools/shfmt" \
+                      https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64
+                  chmod 755 "$RUNNER_TEMP/ci-tools/shfmt"
+                  curl --fail --location --silent --show-error --retry 3 \
+                      -o "$RUNNER_TEMP/shellcheck.tar.xz" \
+                      https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+                  tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+                  install -m 755 "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" "$RUNNER_TEMP/ci-tools/shellcheck"
+                  echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
+
+            - name: Check Bash formatting (including shebang-free bashrc)
+              run: shfmt -d . bashrc
+
+            - name: ShellCheck all shell scripts
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  scripts=(
+                      guix-terminal-jail
+                      guix-agent-jail
+                      guix-codex-cli-jail
+                      environment.sh
+                      bashrc
+                  )
+                  # Library imports use dynamically constructed paths and are
+                  # checked individually. Suppress only unresolved-source notices.
+                  shellcheck -x --shell=bash --severity=warning \
+                      --exclude=SC1090,SC1091 "${scripts[@]}"
+                  shellcheck -x --shell=bash --severity=warning \
+                      --exclude=SC1090,SC1091,SC2034 lib/*.sh
+
+            - name: Bash syntax check
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  scripts=(
+                      guix-terminal-jail
+                      guix-agent-jail
+                      guix-codex-cli-jail
+                      environment.sh
+                      bashrc
+                      lib/*.sh
+                  )
+                  for script in "${scripts[@]}"; do
+                      bash -n "$script"
+                  done
+
+    ci:
+        name: GitHub Actions (actionlint)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out source
+              uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Install pinned actionlint
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p "$RUNNER_TEMP/ci-tools"
+                  curl --fail --location --silent --show-error --retry 3 \
+                      -o "$RUNNER_TEMP/actionlint.tar.gz" \
+                      https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+                  tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/ci-tools" actionlint
+                  chmod 755 "$RUNNER_TEMP/ci-tools/actionlint"
+                  echo "$RUNNER_TEMP/ci-tools" >> "$GITHUB_PATH"
+
+            - name: Validate all GitHub Actions workflows
+              run: actionlint

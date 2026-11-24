@@ -12,7 +12,7 @@ export PYTHONPYCACHEPREFIX=/tmp/guix-agent-pycache
 
 # Keep the lock for the full setup/agent lifetime. Mount the parent of venv
 # so uv can recreate the directory when necessary. uv inherits descriptor 8.
-exec 8>/agent-state/run.lock
+exec 8> /agent-state/run.lock
 flock -x 8
 
 # Some build backends write metadata into the source tree. Give them a
@@ -21,7 +21,7 @@ snapshot=$(python3 /run/guix-jail/stage-app.py /app /agent-state)
 read -ra snapshot_fields <<< "$snapshot"
 source_hash=${snapshot_fields[0]}
 sync_args=(--project /agent-state/source --frozen --no-editable)
-if [[ ! -f /agent-state/synced-source || $(</agent-state/synced-source) != "$source_hash" ]]; then
+if [[ ! -f /agent-state/synced-source || $(< /agent-state/synced-source) != "$source_hash" ]]; then
     # uv normally watches project metadata. Rebuild the application itself
     # when source code changes, including files outside that default watch set.
     for package_name in "${snapshot_fields[@]:1}"; do

@@ -1,11 +1,12 @@
 """Provision a project, preserving idle legacy state and existing credentials."""
+
 import errno
 import fcntl
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 
 def check_identity(directory, project):
@@ -46,11 +47,18 @@ def migrate(old, new, project):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for client in (old / "clients").glob("*"):
             if living(client.name, client.read_bytes().strip()):
-                raise ValueError(f"Close the active legacy session for {project} and retry")
+                raise ValueError(
+                    f"Close the active legacy session for {project} and retry"
+                )
         pid = old / "mitmdump.pid"
         start = old / "mitmdump.start"
-        if pid.is_file() and living(pid.read_text().strip(), start.read_bytes().strip() if start.is_file() else b""):
-            raise ValueError(f"Legacy proxy still active for {project}. Close that session and retry")
+        if pid.is_file() and living(
+            pid.read_text().strip(),
+            start.read_bytes().strip() if start.is_file() else b"",
+        ):
+            raise ValueError(
+                f"Legacy proxy still active for {project}. Close that session and retry"
+            )
         try:
             old.rename(new)
         except OSError as error:
@@ -74,7 +82,9 @@ def prepare(action, project, config, state, old, template):
             if state.exists():
                 marker = state / ".legacy-copy"
                 if not marker.is_file() or marker.read_bytes() != os.fsencode(old):
-                    raise ValueError(f"Both legacy and new state exist: {old} and {state}. Resolve before launch")
+                    raise ValueError(
+                        f"Both legacy and new state exist: {old} and {state}. Resolve before launch"
+                    )
             else:
                 migrate(old, state, project)
         state.mkdir(exist_ok=True)

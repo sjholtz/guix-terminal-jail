@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Sourced inside the container by both launchers. Do not put real API keys here.
 # The host launcher substitutes #PORT# before copying this into container home.
 [[ ${GUIX_JAIL_ENV_READY:-} == 1 ]] && return 0

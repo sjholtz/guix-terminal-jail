@@ -2,11 +2,12 @@
 
 import hashlib
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import sys
+from pathlib import Path
+
 import tomllib
 
 
@@ -44,7 +45,11 @@ def stage(source, state):
     source_hash = fingerprint(source)
     target = state / "source"
     marker = state / "source-hash"
-    if not target.is_dir() or not marker.exists() or marker.read_text().strip() != source_hash:
+    if (
+        not target.is_dir()
+        or not marker.exists()
+        or marker.read_text().strip() != source_hash
+    ):
         temporary = state / "source.new"
         previous = state / "source.old"
         shutil.rmtree(temporary, ignore_errors=True)
@@ -58,7 +63,9 @@ def stage(source, state):
         # Detect edits on the host during the copy before publishing a snapshot.
         if fingerprint(source) != source_hash:
             shutil.rmtree(temporary)
-            raise RuntimeError("Application changed during setup. Run the launcher again.")
+            raise RuntimeError(
+                "Application changed during setup. Run the launcher again."
+            )
         if target.exists():
             target.rename(previous)
         try:
@@ -78,10 +85,15 @@ def stage(source, state):
     with (target / "uv.lock").open("rb") as lockfile:
         for locked in tomllib.load(lockfile).get("package", []):
             location = locked.get("source", {})
-            if any(kind in location for kind in ("directory", "editable", "virtual", "path")):
+            if any(
+                kind in location
+                for kind in ("directory", "editable", "virtual", "path")
+            ):
                 local_packages.add(locked["name"])
     for name in local_packages:
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", name
+        ):
             raise ValueError("Application metadata contains an invalid package name")
     print(source_hash, *sorted(local_packages))
 

@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+JAIL_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+source "$JAIL_DIR/lib/jail-common.sh"
+
+usage() {
+    cat << 'USAGE'
+Usage: guix-codex-cli-jail [options] [project_dir] [-- codex_args...]
+
+Launch Codex in a Guix container with project-specific CWD and shared ~/.codex.
+The workspace defaults to the current directory. Codex always starts in
+/workspaces/<project-id>; /workspace is retained as a compatible alias.
+
+Options:
+  --paths                  Show paths only (no Codex, Guix, or proxy needed).
+  --init                   Initialize private project credentials and show paths.
+  --backend host|standalone  Codex backend (default: host, or GUIX_CODEX_BACKEND).
+  --update                 Install/update the persistent standalone backend.
+                           If --backend is omitted, selects standalone.
+  --add-package PACKAGE    Add a Guix package for this invocation (repeatable).
+  -m PATH                  Host mitmproxy addon (default: bundled inject_keys.py).
+  -p DIR                   Host pnpm directory (default: ~/.local/share/pnpm).
+  -h, --help               Show help.
+
+Examples:
+  guix-codex-cli-jail ~/project
+  guix-codex-cli-jail ~/project -- resume --last
+  guix-codex-cli-jail --paths ~/project
+  guix-codex-cli-jail --update
+  guix-codex-cli-jail --backend standalone ~/project
+USAGE
+}
+
+CODEX_BACKEND=${GUIX_CODEX_BACKEND:-host}
+CODEX_ACTION=run
+BACKEND_EXPLICIT=0
+PROJECT_ARG=
+CODEX_ARGS=()
+while (($#)); do
+    case $1 in
+        --paths | --init)
+            [[ $ACTION == run ]] || die 'Choose only one workspace action.'
+            [[ $CODEX_ACTION == run ]] || die '--update cannot be combined with --paths or --init.'
+            ACTION=${1#--}
+            shift
+            ;;
+        --update)
+            [[ $CODEX_ACTION == run && $ACTION == run ]] || die '--update cannot be combined with other actions.'
+            CODEX_ACTION=update
+            shift
+            ;;
+        --backend)
+            (($# >= 2)) || die 'Missing value for --backend.'
+            CODEX_BACKEND=$2
+            BACKEND_EXPLICIT=1
+            shift 2
+            ;;
+        --add-package)
+            (($# >= 2)) || die 'Missing value for --add-package.'
+            add_package "$2"
+            shift 2
+            ;;
+        -m | -p)
+            (($# >= 2)) || die "Missing value for $1"
+            [[ -n $2 ]] || die "Empty value for $1"
+            case $1 in -m) MITM_SCRIPT=$2 ;; -p) PNPM_HOST_PATH=$2 ;; esac
+            shift 2
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            CODEX_ARGS=("$@")
+            break
+            ;;
+        -*) die "Unknown launcher option: $1 (pass Codex arguments after --)." ;;
+        *)
+            [[ -z $PROJECT_ARG ]] || die 'Use -- before arguments for Codex.'
+            PROJECT_ARG=$1
+            shift
+            ;;
+    esac
+done
+
+if [[ $CODEX_ACTION == update ]]; then
+    ((${#CODEX_ARGS[@]} == 0)) || die '--update does not accept Codex arguments.'
+    if ((BACKEND_EXPLICIT)) && [[ $CODEX_BACKEND != standalone ]]; then
+        die '--update applies only to the standalone backend; update host Codex using npm.'
+    fi
+    CODEX_BACKEND=standalone
+fi
+case $CODEX_BACKEND in host | standalone) ;; *) die "Invalid backend: $CODEX_BACKEND" ;; esac
+
+resolve_workspace "${PROJECT_ARG:-$PWD}"
+source "$JAIL_DIR/lib/codex-common.sh"
+# Preserve the common --paths/--init semantics (including no Guix dependency).
+case $ACTION in
+    paths)
+        show_paths
+        codex_paths
+        exit 0
+        ;;
+    init)
+        prepare_layout init
+        CREDENTIALS_FILE=$PROJECT_ENV
+        show_paths
+        codex_paths
+        exit 0
+        ;;
+esac
+
+if [[ $CODEX_ACTION != update ]]; then prepare_codex_home; fi
+if [[ $CODEX_BACKEND == host ]]; then
+    prepare_host_codex
+    select_launcher_packages codex-host
+else
+    prepare_standalone_codex
+    select_launcher_packages codex-standalone
+fi
+
+init_workspace
+start_workspace
+if [[ $CODEX_ACTION == update ]]; then MOUNT_WORKSPACE=0; fi
+build_guix_args
+add_codex_mounts
+if [[ $CODEX_ACTION == update ]]; then
+    run_container bash /run/guix-jail/update-codex.sh
+else
+    run_container bash /run/guix-jail/run-codex.sh "$CODEX_BACKEND" "$PROJECT_ID" "${CODEX_ARGS[@]}"
+fi

@@ -1,474 +1,297 @@
 # Guix Terminal Jail
 
-Run an interactive shell or a Python agent in a GNU Guix container,
-with a writable workspace and a host-side mitmproxy addon that
-supplies API credentials to selected HTTPS destinations.
+Run a development shell, a uv-managed Python agent, or the OpenAI Codex CLI
+inside a [GNU Guix](https://guix.gnu.org/) Linux container with an
+explicitly selected writable project and a host-side mitmproxy for outbound
+HTTPS requests.
 
-**Author:** Steven J Holtz
+**Author:** Steven J Holtz  
+**License:** GPL-3.0 (see [LICENSE](LICENSE)).
 
-The project provides two entry points:
+Three commands share project identity, private XDG configuration/state,
+mitmproxy lifecycle, mount validation, log management, and cleanup:
 
-- `guix-terminal-jail` opens Bash at `/workspace`.
-- `guix-agent-jail` runs a uv-managed Python application mounted
-  read-only at `/app`, with `/workspace` as its working directory.
+| Launcher | Purpose | Working directory |
+| --- | --- | --- |
+| `guix-terminal-jail` | Interactive Bash shell | `/workspace` |
+| `guix-agent-jail` | Run a locked uv Python application mounted read-only at `/app` | `/workspace` |
+| `guix-codex-cli-jail` | Run Codex from host npm or a persistent standalone installation | `/workspaces/<project-id>` |
 
-Both launchers share the same workspace proxy, temporary container
-home, credential selection, logging, and cleanup code.
+The Codex launcher **also mounts the selected project at `/workspace`** for
+compatibility, but it starts Codex in the unique `/workspaces/<project-id>`
+path.  This means new sessions from different projects can coexist in a
+shared `~/.codex` without all having an identical recorded CWD of
+`/workspace`. Sessions created outside the jail retain their original CWD
+and may require `resume --all`.
 
-## Dependencies
+**Start here:** [INSTALL.md](INSTALL.md) for first-time host setup,
+[TESTING.md](TESTING.md) for regression and end-to-end verification.
 
-The host must run Linux with `/proc` and support `guix shell
---container --emulate-fhs --network`. Install and configure [GNU
-Guix](https://guix.gnu.org/), including its daemon and permissions for
-container use, before launching a jail.
+## Quick start
 
-Required host tools:
+After installing and configuring the host dependencies:
 
-| Dependency | Purpose |
-| --- | --- |
-| Bash | Launchers and shared shell code |
-| GNU Guix | Container construction and runtime packages |
-| Python 3.11+ | Project setup, logging, and TOML parsing |
-| mitmproxy (`mitmdump`) with Python 3.11+ and `python-dotenv` | Host-side HTTPS proxy and credential injection |
-| GNU coreutils, `awk`, `sed`, `tr` | Paths, hashing, state files, and templates |
-| `ss` (usually iproute2), `flock` (util-linux), `ps` (procps) | Proxy readiness checks, locking, and process tracking |
-| Git | Cloning this repository |
+```bash
+# Inspect the paths without starting Guix or mitmproxy.
+guix-codex-cli-jail --paths ~/projects/my-project
 
-The instructions below use host-side `uv` to install mitmproxy with
-its addon dependency in the same Python environment. Another
-installation works if `mitmdump` can import `dotenv` and `tomllib`.
+# One-time per-project initialization, if using private credentials.
+guix-codex-cli-jail --init ~/projects/my-project
 
-The container receives these packages through Guix automatically:
+# Launch Codex using the existing global npm installation.
+guix-codex-cli-jail ~/projects/my-project
+
+# Resume the most recent session whose saved CWD matches this project.
+guix-codex-cli-jail ~/projects/my-project -- resume --last
+
+# Existing entry points continue to work.
+guix-terminal-jail ~/projects/my-project
+guix-agent-jail --app ~/bin/myagent ~/projects/my-project -- --help
+```
+
+Host Codex discovery supports a global npm entry such as:
 
 ```text
-gcc-toolchain uv python bash coreutils git findutils ncurses
-nss-certs less curl cmp grep zlib node sed util-linux nano
+/usr/local/bin/codex ->
+  /usr/local/lib/node_modules/@openai/codex/bin/codex.js
 ```
 
-The first launch will likely be slow as it may need to download or
-build packages. Guix package versions are selected by the host's
-configured channels; this project does not pin a channel revision.
+It resolves this file and mounts **only** the `@openai/codex` package and any
+separately located platform-native package read-only. The container uses Guix
+Node.js to invoke the entrypoint. The host npm installation is **not** copied,
+updated, or modified by the launcher. Continue updating it on the host with
+`sudo npm install -g @openai/codex` if that is your chosen update workflow.
 
-## Installation
+## Commands
 
-### 1. Keep the complete project together
-
-```bash
-git clone https://github.com/sjholtz/guix-terminal-jail.git
-cd guix-terminal-jail
-chmod +x guix-terminal-jail guix-agent-jail
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/guix-terminal-jail" "$HOME/.local/bin/guix-terminal-jail"
-ln -s "$PWD/guix-agent-jail" "$HOME/.local/bin/guix-agent-jail"
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Add the PATH setting to your host shell configuration if
-necessary. Both launchers resolve symlinks to find their supporting
-files. Keep `lib/`, `inject_keys.py`, `environment.sh`, `bashrc`, and
-`.env.example` beside them; copying only the executable scripts is
-insufficient.
-
-In this working tree, `lib/` is ignored by `.gitignore`, and several
-runtime files (including `guix-agent-jail` and `environment.sh`) are
-not yet tracked. A clone of the committed files alone will be
-incomplete until those runtime files are included in the
-repository. The installation requires the complete layout described
-above.
-
-### 2. Install the host proxy
-
-With `uv` installed on the host:
-
-```bash
-uv tool install --python 3.11 --with python-dotenv mitmproxy
-uv tool update-shell
-```
-
-Reload your shell configuration or open a new terminal if needed, then
-check:
-
-```bash
-command -v guix python3 mitmdump ss flock ps
-python3 --version
-mitmdump --version
-```
-
-If you have multiple proxy installations, use `type -a mitmdump` to
-check which one the launcher will run.
-
-### 3. Install header mappings
-
-Run this from the repository directory:
-
-```bash
-config_base="${XDG_CONFIG_HOME:-$HOME/.config}"
-install -d -m 700 "$config_base/guix-terminal"
-install -m 600 key-injector.toml "$config_base/guix-terminal/key-injector.toml"
-```
-
-Use an absolute `XDG_CONFIG_HOME` if setting it explicitly. Shell and
-environment templates have bundled defaults and do not need to be
-copied.
-
-### 4. Configure credentials
-
-Create your workspace directory, then initialize its private
-credentials:
-
-```bash
-mkdir -p "$HOME/projects/my-workspace"
-guix-terminal-jail --init "$HOME/projects/my-workspace"
-```
-
-`--init` prints the resolved paths and creates a project-specific
-`credentials.env` from `.env.example` without overwriting an existing
-file. Edit the **Project credentials** path printed by the command and
-replace the placeholder values with the keys you need. Remove unused
-placeholders or leave those variables empty.
-
-Alternatively, install shared credentials from the repository
-directory:
-
-```bash
-install -m 600 .env.example "$config_base/guix-terminal/credentials.env"
-# Edit that file to supply your keys.
-```
-
-A project credentials file takes precedence over the shared file **as
-a whole**; values are not merged. Running `--init` therefore switches
-that workspace to its project-specific file, even if shared
-credentials already exist.
-
-Credentials are read from the selected file, not from exported
-`HOST_*` variables. Dotenv interpolation is disabled. The old
-parent-directory `.env.guix-terminal-jail` location is no longer read.
-
-### 5. Start a jail
-
-```bash
-guix-terminal-jail "$HOME/projects/my-workspace"
-```
-
-On first use, mitmproxy generates its CA files under the host's
-`~/.mitmproxy`. The launcher exposes only `mitmproxy-ca-cert.cer` to
-the container. The environment template combines it with Guix's public
-CA bundle.
-
-## Interactive shell usage
+### `guix-terminal-jail`
 
 ```text
 guix-terminal-jail [options] [project_dir]
 ```
 
-| Option | Behavior |
-| --- | --- |
-| `project_dir` | Workspace directory; defaults to the current directory |
-| `--paths` | Print paths without creating files or starting Guix/proxy processes |
-| `--init` | Create missing project credentials and prepare project state, then print paths |
-| `--add-package PACKAGE` | Add a Guix package for this launch. Repeat for each additional package. |
-| `-m PATH` | Select a host mitmproxy addon; defaults to bundled `inject_keys.py` |
-| `-p DIR` | Select a host pnpm directory; defaults to `~/.local/share/pnpm` |
-| `-h`, `--help` | Show help |
+Opens an interactive shell at `/workspace`. The project defaults to the host
+current directory. Options: `--paths`, `--init`, repeatable
+`--add-package PACKAGE`, `-m MITM_ADDON`, `-p PNPM_DIR`, and `-h`.
 
-For example:
-
-```bash
-cd "$HOME/projects/my-workspace"
-guix-terminal-jail --paths
-guix-terminal-jail
-```
-
-The `--paths` option will show you where important files are located
-and how external paths are mapped internally.
-
-Inside the shell, the workspace is `/workspace`. Run your normal
-development commands there, such as `uv sync` or `uv run python
-main.py`. Type `exit` to leave; the bundled Bash configuration ignores
-Ctrl+D.
-
-Opening another jail for the same canonical workspace path reuses the
-same proxy and container home, so 2 or more terminals can be opened to
-the same contained environment. Each launch still creates its own Guix
-container. Separate workspaces use separate state and proxies.
-
-If the selected pnpm directory exists, it is mounted read-only at
-`/host-pnpm`, and `/host-pnpm/bin` is added to PATH. pnpm is optional
-and is not installed by these scripts.
-
-## Python agent usage
+### `guix-agent-jail`
 
 ```text
 guix-agent-jail [options] [workspace_dir] [-- agent_args...]
 ```
 
-| Option | Behavior |
-| --- | --- |
-| `-a DIR`, `--app DIR` | Application directory; defaults to `GUIX_AGENT_APP_DIR` |
-| `-e FILE`, `--entry FILE` | Python script relative to the application; defaults to `main.py` |
-| `--paths`, `--init` | Same workspace actions as the terminal launcher; no application required |
-| `--add-package PACKAGE` | Add a Guix package for this launch. Repeat for each additional package. |
-| `-m PATH`, `-p DIR` | Same addon and pnpm settings as the terminal launcher |
-| `-h`, `--help` | Show help |
+Runs an existing Python application with a `pyproject.toml`, `uv.lock`, and
+Python entry script. Choose the application with `-a DIR` / `--app DIR` or
+`GUIX_AGENT_APP_DIR`; select the agent start-up script with `-e FILE` /
+`--entry FILE` (default: `main.py`). The application path cannot overlap
+the workspace.
 
-The application needs `pyproject.toml` with `[project].name`, a
-committed `uv.lock`, and the entry script. The application and
-workspace must be separate: neither directory may contain the
-other. The entry must resolve to a file inside the application
-directory.
+Application source is mounted read-only at `/app`. A per-application,
+per-project writable copy and virtual environment live at `/agent-state`.
+The launcher locks that state, stages source, runs `uv sync --frozen
+--no-editable`, then `uv run --frozen --no-sync` to execute the entry.
+The default working directory remains `/workspace`. Its other options are
+`--paths`, `--init`, repeatable `--add-package`, `-m`, `-p`, and `-h`.
 
-```bash
-# Application code lives outside the writable workspace.
-guix-agent-jail --app "$HOME/bin/myagent" "$HOME/projects/my-workspace"
-
-# Select a different entry and pass arguments to it.
-guix-agent-jail --app "$HOME/bin/myagent" --entry scripts/run.py \
-  "$HOME/projects/my-workspace" -- --verbose
-
-# Or configure a default application for this host shell.
-export GUIX_AGENT_APP_DIR="$HOME/bin/myagent"
-guix-agent-jail "$HOME/projects/my-workspace" -- --verbose
-```
-
-For each application/workspace pair, the launcher:
-
-1. Mounts the application read-only at `/app` and persistent
-   application state at `/agent-state`.
-2. Acquires a lock for the entire setup and run. Concurrent runs of
-   the same pair wait; different pairs have separate locks.
-3. Stages a writable application copy under `/agent-state/source`,
-   excluding `.venv` and `__pycache__`, for build backends that write
-   metadata.
-4. Runs `uv sync --frozen --no-editable` with the virtual environment
-   at `/agent-state/venv`. Source changes refresh the copy and trigger
-   reinstallation of local packages.
-5. Runs `uv run --project /agent-state/source --frozen --no-sync
-   python /app/<entry>` with the supplied arguments and `/workspace`
-   as the working directory.
-
-Application state survives normal shutdown. Python bytecode is
-redirected to temporary container storage. Dependencies must work with
-the container's available tools and mounts; host paths outside the
-exposed directories are unavailable.
-
-## Adding Guix packages
-
-Both launchers accept one Guix package specification per
-`--add-package` option. Put the options before the workspace path.
-Guix adds the requested packages alongside the default packages for
-that container launch.
-
-For an agent that needs to compile LaTeX documents to PDF:
-
-```bash
-guix-agent-jail --app "$HOME/bin/myagent" \
-  --add-package texlive-latexmk \
-  --add-package texlive-latex-fonts \
-  --add-package texlive-collection-latexrecommended \
-  "$HOME/projects/my-workspace"
-```
-
-Use the same options with `guix-terminal-jail` to compile manually.
-Inside the jail, run `latexmk -pdf main.tex` from the document directory.
-
-## Credential injection
-
-The bundled mappings are:
-
-| Exact destination host | Header | Credentials file variable |
-| --- | --- | --- |
-| `api.openai.com` | `Authorization: Bearer …` | `HOST_OPENAI_API_KEY` |
-| `ollama.com` | `Authorization: Bearer …` | `HOST_OLLAMA_API_KEY` |
-| `api.githubcopilot.com` | `Authorization: Bearer …` | `HOST_GITHUB_API_KEY` |
-| `api.anthropic.com` | `x-api-key` | `HOST_ANTHROPIC_API_KEY` |
-| `api.smith.langchain.com` | `x-api-key` | `HOST_LANGSMITH_API_KEY` |
-
-Add `HOST_GITHUB_API_KEY` yourself if needed; it is not in
-`.env.example`. The example also contains `HOST_GOOGLE_API_KEY`, but
-there is no bundled Google mapping.
-
-The injector only modifies HTTPS requests on port 443. Host matching
-is exact after lowercasing and removing a trailing dot; subdomains do
-not match automatically. A matching header is replaced or
-added. Missing or empty keys produce a warning and leave the request
-header unchanged.
-
-Customize `key-injector.toml` using these two supported sections:
-
-```toml
-[[auth.headers]]
-host = "api.openai.com"
-environment_variable = "HOST_OPENAI_API_KEY"
-
-[[x-api.headers]]
-host = "api.anthropic.com"
-environment_variable = "HOST_ANTHROPIC_API_KEY"
-```
-
-`auth` always supplies the `Bearer ` prefix; `x-api` supplies the raw
-value. Set `KEY_INJECTOR_CONFIG` in the host environment or selected
-credentials file to use another TOML file. The host environment takes
-precedence. Use an absolute path for predictable resolution.
-
-Credentials and mappings load when the proxy starts. Close all
-sessions for the workspace and relaunch after editing them. An active
-proxy rejects attempts to attach using a different addon,
-credential-file path, or config override.
-
-## Configuration, state, and logs
-
-Absolute XDG base paths are honored. Unset or relative values fall
-back to the following defaults:
+### `guix-codex-cli-jail`
 
 ```text
-~/.config/guix-terminal/
-  key-injector.toml
-  credentials.env                  # optional shared credentials
-  bashrc                           # optional interactive shell override
-  environment.sh                   # optional environment override
-  projects/<project-id>/
-    project_path
-    credentials.env                # optional project credentials
-
-~/.local/state/guix-terminal/projects/<project-id>/
-  project_path
-  mitmdump.log
-  workspace.lock
-  mitmdump.pid / mitmdump.start / mitmdump.port / proxy_config
-  clients/
-  home/                            # exists while workspace sessions are active
-  bash_history / lesshst / python_history
-  apps/<application-hash>/          # persistent source copy, venv, and run lock
+guix-codex-cli-jail [options] [project_dir] [-- codex_args...]
 ```
 
-The project ID combines a sanitized directory name and the first 12
-characters of the SHA-256 hash of its canonical absolute
-path. Application state uses a hash of the application's canonical
-path. Moving either directory changes its identity.
+| Option | Meaning |
+| --- | --- |
+| `project_dir` | Host project directory; default current directory |
+| `--paths` | Show project/config/state, Codex paths and backend; no files created |
+| `--init` | Create missing project-specific credentials; preserves existing credentials |
+| `--backend host` | Reuse host global npm package read-only (**default**) |
+| `--backend standalone` | Reuse persistent Guix-installed standalone executable |
+| `--update` | Install/update **standalone** backend; implies standalone unless backend explicitly set |
+| `--add-package PACKAGE` | Add another Guix package for this invocation; repeatable |
+| `-m PATH`, `-p DIR` | Override proxy addon or host pnpm location |
+| `-h`, `--help` | Help |
 
-Use `--paths` to find the actual locations. `mitmdump.log` combines
-timestamped launcher events and proxy stdout/stderr, including
-injector messages. It replaces the old standalone `inject_keys.log`;
-`KEY_INJECTOR_LOG` is not used by the current code. The log is
-appended and is not automatically rotated.
+Use `--` to separate launcher options from Codex options:
 
-Launchers use `umask 077`; existing files and directories are not
-recursively reset to private permissions. Keep credentials, state, and
-logs private.
+```bash
+guix-codex-cli-jail ~/projects/app -- --version
+guix-codex-cli-jail ~/projects/app -- login status
+guix-codex-cli-jail ~/projects/app -- resume --last
+guix-codex-cli-jail ~/projects/app -- resume --all
+```
 
-On normal last-session exit, the launcher stops the workspace proxy,
-copies supported histories into that workspace's state, and removes
-the shared container home. Other home-directory changes are
-discarded. Histories are per workspace; there is no global history
-merge or deduplication. HUP, INT, and TERM are forwarded through the
-container process tree before cleanup.
+`GUIX_CODEX_BACKEND=standalone` changes the default backend. For a non-standard
+host npm executable path, set `GUIX_CODEX_HOST_ENTRY` to the full path of the
+installed `codex.js` or its symlink; it must resolve to an
+`@openai/codex/bin/codex.js` npm installation. Both `x86_64` and `aarch64`
+Linux native dependency layouts are supported, including dependencies nested
+inside the Codex package or located in a sibling `@openai` package directory.
+Unsupported/missing native packages are reported before starting Guix.
 
-Idle legacy state under
-`~/.config/guix-terminal/state/projects/<full-hash>` is migrated
-during initialization or launch. Active legacy sessions must be closed
-first. Conflicting legacy and current state causes an error for manual
-resolution. Cross-filesystem migration retains the original as a
-backup.
+#### Persistent standalone alternative
 
-## Container environment and access
+If the host npm binary cannot run inside Guix, or you prefer separate updates:
 
-| Host resource | Container location | Access |
+```bash
+# Uses the official downloaded installer inside a Guix container.
+# No host npm installation is required for this command.
+guix-codex-cli-jail --update
+
+# Reuse that installation without downloading it again.
+guix-codex-cli-jail --backend standalone ~/projects/app
+
+# Update again, explicitly, when desired.
+guix-codex-cli-jail --update
+```
+
+The installer writes under `$XDG_STATE_HOME/guix-terminal/codex-cli/` (i.e.
+`~/.local/state/guix-terminal/codex-cli/`). It stores an executable link in
+`bin/` and release files in `store/packages/standalone/`. A single installation
+is reused across projects. **`--update` never updates the host npm package.**
+
+During an update, the launcher deliberately does not mount the selected
+project or the shared `~/.codex` directory into the container. It still uses
+the selected project's proxy and temporary container home. The downloaded
+installer is remote executable code: review the installer and use this option
+only if you trust the source. No installer is run on ordinary launches.
+
+## Session history and paths
+
+For each canonical host project path, the common launcher computes a stable
+`<sanitized-name>-<12-character-hash>` ID. For example:
+
+```text
+Host:       ~/projects/api-service
+Terminal:   /workspace
+Codex CWD:  /workspaces/api-service-abcdef012345
+CODEX_HOME: ~/.codex (shared read/write with host)
+```
+
+Only the selected project is exposed in each container; distinct projects have
+different IDs. `resume --last` uses Codex's CWD filtering for new sessions.
+The `--all` selector can display sessions created elsewhere, including on the
+host. Resuming older host sessions does **not** magically translate their
+stored absolute paths. Do not depend on arbitrary absolute `/workspace` paths
+in prompts, stored commands, or AGENTS.md content if they must also work when
+resumed from another project or on the host.
+
+**Security implication:** Sharing `~/.codex` read/write exposes Codex's saved
+session and authentication data (including any file-based tokens) to processes
+inside the Codex container. This is a deliberate exception to the usual
+proxy-only API-key model. Do not use this mode with untrusted processes or
+assume Codex's own sandbox can protect secrets mounted into its container.
+The script unsets the common `OPENAI_API_KEY=dummy_key` before launching Codex,
+allowing its saved ChatGPT login to be used. Keychain-only host login may not be
+available from inside the container; file-based login should be checked on
+your machine using `-- login status`.
+
+## Package selection
+
+The package definitions are in [`lib/packages.sh`](lib/packages.sh), separate
+from the shared container execution code. Change one profile without changing
+the others:
+
+| Profile | Package variable | Initial packages |
 | --- | --- | --- |
-| Selected workspace | `/workspace` | Read/write |
-| Workspace's temporary home | Host user's home path inside container | Read/write |
-| `~/.cache/uv`, `~/.local/share/uv` | Same paths inside container | Read/write, shared across workspaces |
-| `~/.mitmproxy/mitmproxy-ca-cert.cer` | Same path inside container | Read-only |
-| Bundled `lib/` | `/run/guix-jail` | Read-only |
-| Optional host pnpm directory | `/host-pnpm` | Read-only |
-| Agent application | `/app` | Read-only, agent launcher only |
-| Application/workspace state | `/agent-state` | Read/write, agent launcher only |
+| All launchers | `BASE_GUIX_PACKAGES` | `bash coreutils git findutils ncurses nss-certs less curl cmp grep zlib sed util-linux nano tar gzip gawk` |
+| Interactive shell | `TERMINAL_GUIX_PACKAGES` | `gcc-toolchain uv python node` |
+| Python agent | `AGENT_GUIX_PACKAGES` | `gcc-toolchain uv python node` |
+| Host npm Codex | `CODEX_HOST_GUIX_PACKAGES` | `node` |
+| Standalone Codex | `CODEX_STANDALONE_GUIX_PACKAGES` | Empty |
 
-The launchers reject mount sources that overlap the host's default or
-configured configuration directory, including ancestors such as the
-entire host home. Mount sources containing `=` are also rejected.
+`tar`, `gzip`, and `gawk` remain in the base group by design. All launchers
+also accept `--add-package PACKAGE` on a per-run basis. Guix package versions
+follow your configured Guix channels; this repository does not pin channels.
 
-`environment.sh` configures lowercase and uppercase proxy variables,
-localhost proxy exclusions, dummy OpenAI/Anthropic/Ollama/LangSmith
-keys, and CA variables for Python, requests, curl, Git, and Node. Its
-default LangSmith tracing setting is `false`. The bundled interactive
-`bashrc` also sets proxy and CA variables and changes LangSmith
-tracing to `true`, with project `lca-deepagents`. Customize both
-templates if you need consistent interactive and agent settings. Both
-support the launcher's `#PORT#` substitution.
+## Credentials, proxy and state
 
-## Isolation limits
+The shared configuration root is `${XDG_CONFIG_HOME:-$HOME/.config}/guix-terminal`
+and state is `${XDG_STATE_HOME:-$HOME/.local/state}/guix-terminal`.
 
-The container limits filesystem access to Guix runtime resources and
-the mounts described above. The bundled injector keeps its real
-credential file on the host and supplies credentials at the proxy
-boundary. Keep secrets out of the workspace, application source,
-shared caches, pnpm directory, and custom container templates.
+| Resource | Location | Behavior |
+| --- | --- | --- |
+| Shared credentials | `config/guix-terminal/credentials.env` | Read by host-side proxy |
+| Per-project credentials | `config/guix-terminal/projects/<id>/credentials.env` | If present, replaces shared credentials for that project |
+| Per-project proxy log | `state/guix-terminal/projects/<id>/mitmdump.log` | Append-only timestamps and port information |
+| Project temporary home | `state/guix-terminal/projects/<id>/home` | Removed after last session exits; supported history files retained |
+| Python agent state | `state/guix-terminal/projects/<id>/apps/<app-hash>` | Persistent staged source + uv virtual environment |
+| Standalone Codex binaries | `state/guix-terminal/codex-cli` | Persistent, shared across projects |
+| Codex sessions and login | `~/.codex` | Host and Codex jail share it read/write |
 
-Networking is shared with the host through `--network`. Proxy
-environment variables configure cooperative clients; they do **not**
-enforce proxy use, block direct connections, or prevent access to host
-loopback services. CA settings establish trust and do not enforce
-traffic routing. Files readable in the container can be sent over the
-network.
+`--paths` does not initialize state, start a proxy, or require Guix. `--init`
+creates a project credentials file from `.env.example` only if missing; repeat
+calls preserve the file. By default, only a selected set of provider endpoints
+receives credentials injected by the host mitmproxy addon. Environment and
+proxy templates live in `environment.sh`, `bashrc`, `key-injector.toml`, and
+`inject_keys.py`. For project-specific overrides, install files under the
+printed configuration root as described in INSTALL.md.
 
-The default injector is not a request allowlist or spending control: a
-process can make authenticated requests to mapped providers through
-the proxy. Other local processes able to reach the loopback proxy may
-also use it. Containers and caches are not isolated from other
-sessions running as the same host user. Protect the host mitmproxy CA
-private key; only its public certificate is mounted by the launcher.
+Each workspace's running sessions share one proxy and temporary home, with a
+client registry and lock to manage concurrency. On the final session exit,
+that proxy is stopped and supported shell histories are preserved. `HUP`,
+`INT`, and `TERM` are forwarded to the container process tree. A crash or a
+host reboot may leave state requiring manual cleanup.
 
-`agent-guardrails.py` is a separate example addon with a route
-allowlist and a 100-request budget per addon instance. Selecting it
-with `-m` **replaces** credential injection; it is not enabled or
-combined with the injector automatically, and it only sees traffic
-sent through the proxy.
+## Filesystem and network boundaries
 
-## Example Use
+The common container uses `guix shell --container --emulate-fhs --network
+--no-cwd`. Its standard mounts are the selected project (`/workspace`), a
+project-specific temporary home, uv caches, mitmproxy's **public CA
+certificate only**, the read-only `lib/` scripts, and the optional read-only
+pnpm directory. Additional mounts depend on the launcher:
 
-An example use would be executing your own custom coding agent
-(located in the app directory, e.g. `~/bin/myagent`) on project code
-that is located in the workspace path
-(e.g. `"$HOME/projects/my-workspace"`). This provides the ability to
-securely execute your custom agent on a subset of your filesystem and
-have the confidence that that agent will not run over your important
-files or exfiltrate your secrets.
+| Launcher | Additional mounts |
+| --- | --- |
+| Agent | Read-only `/app` source and writable `/agent-state` |
+| Codex host | Read-only Codex npm package(s), `/workspaces/<id>` project alias, writable `~/.codex` |
+| Codex standalone | Writable standalone installation, `/workspaces/<id>` alias, writable `~/.codex` |
+| Standalone updater | Writable standalone installation only (no project and no `~/.codex`) |
+
+Mount validation forbids exposing host `~/.config`, its configured XDG
+configuration counterpart, or their ancestors, including the entire home.
+Mount inputs containing the Guix mapping delimiter `=` are rejected. A
+symlinked host `~/.codex` is rejected by the new launcher.
+
+**Isolation is limited.** Containers have network access; environment proxy
+variables do not force traffic through the proxy, prevent outbound connections,
+or block host-loopback services. Shared mounts and same-user host processes
+are not isolated from one another. The proxy injector is not a network
+allowlist. Codex's additional sandbox may be unavailable inside the nested
+Guix container; do not use `--dangerously-bypass-approvals-and-sandbox` as a
+substitute for testing permissions. The new Codex integration is not a
+security guarantee that code cannot access its deliberately mounted files.
 
 ## Troubleshooting
 
-- **Missing credentials:** run `--paths`, then initialize project
-  credentials with `--init` or install the shared
-  file. Parent-directory dotenv files and exported `HOST_*` keys are
-  not credential sources.
-- **Proxy cannot start:** inspect the printed workspace log. The
-  launcher tries only loopback ports **8080–8089** and verifies that
-  the started process owns the listener. Check for occupied ports,
-  addon import errors, and missing or invalid TOML.
-- **`No module named dotenv`:** ensure the selected `mitmdump`
-  installation includes `python-dotenv`, as shown above.
-- **TLS errors:** check the host CA certificate and your
-  `environment.sh`/`bashrc` overrides. Certificate-pinning clients may
-  reject proxy interception.
-- **API requests missing from the proxy log:** the client may ignore
-  proxy environment variables. Configure its transport
-  explicitly. Merely setting a CA bundle does not route traffic
-  through the proxy.
-- **Mount rejected:** choose a workspace/application outside host
-  configuration directories. Do not select the entire host home as the
-  workspace.
-- **Agent appears to wait:** another run may hold the lock for that
-  application/workspace pair.
-- **Changes to credentials have no effect:** close every jail for the
-  workspace so its proxy exits, then restart.
+- **Missing proxy credentials:** use `--paths`, then `--init`, or create shared
+  credentials per INSTALL.md; there is no implicit import of host environment
+  `HOST_*` variables.
+- **Proxy won't start:** inspect the selected project's `mitmdump.log`. The
+  launcher tries ports 8080–8089 on `127.0.0.1`.
+- **Missing Codex native dependency:** confirm `npm ls -g @openai/codex` and
+  inspect the package's nested `node_modules/@openai` directory. The launcher
+  does not expose all of `/usr/local` to hide a broken package structure.
+- **Not logged into Codex:** verify `codex login status` on the host, then
+  `guix-codex-cli-jail PROJECT -- login status`. File-based auth can work;
+  host OS keychain integration may not be available inside Guix.
+- **`resume --last` sees no sessions:** use `-- resume --all` to inspect
+  sessions from different directories. New jail sessions should be scoped to
+  `/workspaces/<id>`.
+- **Codex TLS failures:** check your mitmproxy CA, the combined CA bundle in
+  `environment.sh`, and the network/proxy behavior of the Codex binary.
+- **Nested sandbox errors:** test with a disposable project; nested namespace
+  and Bubblewrap support depends on your Guix/kernel setup. Do not silently
+  weaken approval controls.
+- **`--update` doesn't change host `codex --version`:** expected; it updates
+  only the persistent standalone backend.
+- **A launcher fails after a package update:** close active sessions and verify
+  the host npm package layout and native dependency before restarting.
 
-## Project files
+Run the offline regression suite using:
 
-The root launchers and `lib/` implement the current
-runtime. `inject_keys.py` is the default host addon;
-`key-injector.toml` supplies mappings; `.env.example` supplies the
-credential template; `bashrc` and `environment.sh` configure container
-sessions.
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-## License
-
-See [LICENSE](LICENSE) for the GNU General Public License, version 3.
+See [TESTING.md](TESTING.md) for complete host acceptance tests and expected
+limitations of offline checks.

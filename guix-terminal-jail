@@ -4,9 +4,10 @@ umask 077
 
 JAIL_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 source "$JAIL_DIR/lib/jail-common.sh"
+select_launcher_packages terminal
 
 usage() {
-    cat <<'USAGE'
+    cat << 'USAGE'
 Usage: guix-terminal-jail [options] [project_dir]
 
 Open an interactive Bash shell at /workspace.
@@ -23,22 +24,35 @@ while getopts "hm:p:-:" opt; do
     case "$opt" in
         -)
             case "$OPTARG" in
-                paths|init) [[ $ACTION == run ]] || die "Choose one project action."; ACTION=$OPTARG ;;
-                help) usage; exit 0 ;;
+                paths | init)
+                    [[ $ACTION == run ]] || die "Choose one project action."
+                    ACTION=$OPTARG
+                    ;;
+                help)
+                    usage
+                    exit 0
+                    ;;
                 add-package)
                     add_package "${!OPTIND-}"
                     ((OPTIND += 1))
                     ;;
                 *) die "Unknown option: --$OPTARG" ;;
-            esac ;;
-        h) usage; exit 0 ;;
+            esac
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
         m) MITM_SCRIPT=$OPTARG ;;
         p) PNPM_HOST_PATH=$OPTARG ;;
-        *) usage >&2; exit 1 ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
     esac
 done
 shift $((OPTIND - 1))
-(( $# <= 1 )) || die "Expected at most one project directory."
+(($# <= 1)) || die "Expected at most one project directory."
 handle_workspace_action "${1:-$PWD}"
 init_workspace
 start_workspace

@@ -4,9 +4,10 @@ umask 077
 
 JAIL_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 source "$JAIL_DIR/lib/jail-common.sh"
+select_launcher_packages agent
 
 usage() {
-    cat <<'USAGE'
+    cat << 'USAGE'
 Usage: guix-agent-jail [options] [workspace_dir] [-- agent_args...]
 
 Run a uv-managed Python application with its working directory at /workspace.
@@ -37,28 +38,37 @@ APP_DIR=${GUIX_AGENT_APP_DIR:-}
 ENTRY=main.py
 PROJECT_ARG=
 AGENT_ARGS=()
-while (( $# )); do
+while (($#)); do
     case $1 in
-        --paths|--init)
+        --paths | --init)
             [[ $ACTION == run ]] || die "Choose one project action."
-            ACTION=${1#--}; shift ;;
-        -h|--help) usage; exit 0 ;;
+            ACTION=${1#--}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
         --add-package)
             add_package "${2-}"
             shift 2
             ;;
-        -a|--app|-e|--entry|-m|-p)
-            (( $# >= 2 )) || die "Missing value for $1"
+        -a | --app | -e | --entry | -m | -p)
+            (($# >= 2)) || die "Missing value for $1"
             [[ -n $2 ]] || die "Empty value for $1"
             case $1 in
-                -a|--app) APP_DIR=$2 ;;
-                -e|--entry) ENTRY=$2 ;;
+                -a | --app) APP_DIR=$2 ;;
+                -e | --entry) ENTRY=$2 ;;
                 -m) MITM_SCRIPT=$2 ;;
                 -p) PNPM_HOST_PATH=$2 ;;
             esac
             shift 2
             ;;
-        --) shift; AGENT_ARGS=("$@"); break ;;
+        --)
+            shift
+            AGENT_ARGS=("$@")
+            break
+            ;;
         -*) die "Unknown option: $1" ;;
         *)
             [[ -z $PROJECT_ARG ]] || die "Use -- before arguments for the agent."
@@ -76,8 +86,8 @@ APP_DIR=$(realpath -e -- "$APP_DIR")
 # resolve_workspace() has already canonicalized PROJECT_DIR. Neither root
 # may contain the other: /workspace is writable, while /app is read-only.
 if [[ $APP_DIR == "$PROJECT_DIR" ||
-      $APP_DIR == "$PROJECT_DIR/"* ||
-      $PROJECT_DIR == "$APP_DIR/"* ]]; then
+    $APP_DIR == "$PROJECT_DIR/"* ||
+    $PROJECT_DIR == "$APP_DIR/"* ]]; then
     die "Application and workspace directories must not overlap."
 fi
 check_mount_source "$APP_DIR"

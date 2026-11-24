@@ -1,6 +1,7 @@
 """Timestamp each physical line of the proxy's combined stdout/stderr."""
-from datetime import datetime
+
 import sys
+from datetime import datetime
 
 port = sys.argv[1]
 for line in sys.stdin.buffer:

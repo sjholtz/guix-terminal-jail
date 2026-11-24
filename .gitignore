@@ -148,6 +148,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -218,3 +219,7 @@ __marimo__/
 
 # My personal notes:
 Notes.org
+
+# Project files
+!.env.example
+credentials.env
